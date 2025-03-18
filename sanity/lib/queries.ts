@@ -32,3 +32,9 @@ export const postQuery = defineQuery(`
     ${postFields}
   }
 `);
+
+export const postsQuery = defineQuery(`
+  *[_type == "post" && defined(slug.current)] | order(date desc, _updatedAt desc) [0...$limit] {
+    ${postFields}
+  }
+`);
