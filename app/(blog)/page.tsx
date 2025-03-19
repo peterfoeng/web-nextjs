@@ -17,13 +17,13 @@ export default async function Page() {
           </div>
           <div className="flex flex-col items-center gap-6">
             <div>
-              <div className="text-3xl font-bold">Hi, <h1 className="inline">I'm Peter Foeng</h1></div>
+              <div className="text-3xl font-bold">Hi, <h1 className="inline">I&apos;m Peter Foeng</h1></div>
             </div>
             <p className="text-sm">
-              I'm a Melbourne-based front-end web developer, juggling freelance projects alongside my full-time role. My passion lies in working with local Australian businesses to build a strong online presence.
+              I&apos;m a Melbourne-based front-end web developer, juggling freelance projects alongside my full-time role. My passion lies in working with local Australian businesses to build a strong online presence.
             </p>
             <p className="text-sm">
-              With over a decade of experience, I’ve crafted dynamic web experiences for some of Melbourne's leading digital agencies. Now, I’m pushing the boundaries of front-end development at carsales, blending innovation with expertise.
+              With over a decade of experience, I’ve crafted dynamic web experiences for some of Melbourne&apos;s leading digital agencies. Now, I&apos;m pushing the boundaries of front-end development at carsales, blending innovation with expertise.
             </p>
             <p className="text-sm">
               If you need to contact me, please send me an email at <a href="mailto:peter@peterfoeng.com">peter@peterfoeng.com</a>

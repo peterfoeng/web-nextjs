@@ -27,25 +27,25 @@ export async function generateMetadata(): Promise<Metadata> {
   const title = settings?.title || demo.title;
   const description = settings?.description || demo.description;
 
-  const ogImage = resolveOpenGraphImage(settings?.ogImage);
-  let metadataBase: URL | undefined = undefined;
-  try {
-    metadataBase = settings?.ogImage?.metadataBase
-      ? new URL(settings.ogImage.metadataBase)
-      : undefined;
-  } catch {
-    // ignore
-  }
+  // const ogImage = resolveOpenGraphImage(settings?.ogImage);
+  // let metadataBase: URL | undefined = undefined;
+  // try {
+  //   metadataBase = settings?.ogImage?.metadataBase
+  //     ? new URL(settings.ogImage.metadataBase)
+  //     : undefined;
+  // } catch {
+  //   ignore
+  // }
   return {
-    metadataBase,
+    // metadataBase,
     title: {
       template: `%s | ${title}`,
       default: title,
     },
     description: toPlainText(description),
-    openGraph: {
-      images: ogImage ? [ogImage] : [],
-    },
+    // openGraph: {
+    //   images: ogImage ? [ogImage] : [],
+    // },
   };
 }
 
@@ -61,7 +61,7 @@ export default async function RootLayout({
   children: React.ReactNode;
 }) {
   const data = await sanityFetch({ query: settingsQuery });
-  const footer = data?.footer || [];
+  // const footer = data?.footer || [];
   const { isEnabled: isDraftMode } = await draftMode();
 
   return (
