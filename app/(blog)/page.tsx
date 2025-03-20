@@ -1,13 +1,32 @@
+import { sanityFetch } from '@/sanity/lib/fetch';
+import { pageQuery } from '@/sanity/lib/queries';
+import { Metadata } from 'next';
 import Image from 'next/image';
 
-export default async function Page() {
-  // const [settings, heroPost] = await Promise.all([
-  //   sanityFetch({
-  //     query: settingsQuery,
-  //   }),
-  //   sanityFetch({ query: heroQuery }),
-  // ]);
+interface PageParams {
+  params: {
+    slug: string;
+  };
+}
 
+async function getPageData(slug: string) {
+  return sanityFetch({
+    query: pageQuery,
+    params: { slug }
+  });
+}
+
+export async function generateMetadata({ params }: PageParams): Promise<Metadata> {
+  const page = await getPageData(params.slug ?? "home");
+
+  return {
+    title: page?.title,
+    description: page?.seo?.metadata,
+    keywords: page?.seo?.metadatakeywords,
+  };
+}
+
+export default async function Page() {
   return (
       <div className="flex items-center justify-center min-h-screen">
         <div className="mx-auto flex flex-col items-center text-center px-4 py-8" style={{ maxWidth: 600 }}>
@@ -29,7 +48,7 @@ export default async function Page() {
               If you need to contact me, please send me an email at <a href="mailto:peter@peterfoeng.com">peter@peterfoeng.com</a>
             </p>
           </div>
-         
+
         </div>
       </div>
   );

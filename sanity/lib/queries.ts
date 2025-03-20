@@ -20,6 +20,18 @@ export const heroQuery = defineQuery(`
   }
 `);
 
+export const pageQuery = defineQuery(`
+  *[_type == "page" && slug.current == $slug] [0] {
+    _id,
+    title,
+    slug,
+    seo {
+      metadata,
+      metadatakeywords
+    }
+  }
+`);
+
 export const moreStoriesQuery = defineQuery(`
   *[_type == "post" && _id != $skip && defined(slug.current)] | order(date desc, _updatedAt desc) [0...$limit] {
     ${postFields}
