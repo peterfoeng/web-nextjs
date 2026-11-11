@@ -1,0 +1,1887 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>System design: Online home loan application</title>
+  <link href="https://cdn.jsdelivr.net/npm/daisyui@5" rel="stylesheet" type="text/css" />
+  <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+  <style>
+    html { scroll-behavior: smooth; }
+    section { scroll-margin-top: 5rem; }
+    pre.mermaid { background: transparent; }
+    .grid > * { min-width: 0; }
+  </style>
+</head>
+<body>
+<div class="drawer lg:drawer-open">
+  <input id="nav-drawer" type="checkbox" class="drawer-toggle" />
+
+  <div class="drawer-content">
+    <!-- Top bar -->
+    <div class="navbar bg-base-200 sticky top-0 z-30 shadow-sm">
+      <div class="navbar-start">
+        <label for="nav-drawer" class="btn btn-ghost btn-sm lg:hidden" aria-label="Open menu">☰</label>
+        <span class="font-semibold px-2">Home loan backend: system design notes</span>
+      </div>
+      <div class="navbar-end gap-2">
+        <span class="text-sm opacity-70 hidden sm:inline">Dark</span>
+        <input id="theme-toggle" type="checkbox" class="toggle toggle-sm" aria-label="Dark mode" />
+      </div>
+    </div>
+
+    <main class="max-w-5xl mx-auto p-4 lg:p-8 space-y-20">
+
+      <!-- ================= OVERVIEW ================= -->
+      <section id="overview" class="space-y-6">
+        <div>
+          <div class="flex flex-wrap gap-2 mb-3">
+            <span class="badge badge-soft">System design interview prep</span>
+            <span class="badge badge-soft">CBA role</span>
+            <span class="badge badge-soft">Updated 11 Nov 2026</span>
+          </div>
+          <h1 class="text-3xl lg:text-4xl font-bold">Designing the backend for starting a home loan online</h1>
+          <p class="mt-3 text-lg opacity-80">A customer fills in a multi-step form over a few days, uploads payslips and ID, then submits it for assessment.</p>
+        </div>
+
+        <div class="card bg-base-200">
+          <div class="card-body">
+            <h2 class="card-title">Where we are</h2>
+            <ul class="steps steps-vertical md:steps-horizontal w-full">
+              <li class="step step-primary">Requirements &amp; API</li>
+              <li class="step step-primary">Scale</li>
+              <li class="step step-primary">Documents &amp; malware scanning</li>
+              <li class="step">Protecting personal data</li>
+              <li class="step">Storage deep dive</li>
+              <li class="step">Handling failures</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="alert alert-info alert-soft">
+          <span><strong>Interview order to follow:</strong> requirements, then rough estimates, then API and states, then storage, then failures. Always <em>state your assumptions</em> and show that the design doesn't change if they're off by 2×.</span>
+        </div>
+      </section>
+
+      <!-- ================= REQUIREMENTS ================= -->
+      <section id="requirements" class="space-y-6">
+        <h2 class="text-2xl font-bold">1. Requirements</h2>
+        <div class="grid md:grid-cols-3 gap-4">
+          <div class="card card-border bg-base-100">
+            <div class="card-body">
+              <h3 class="card-title text-base">What it must do</h3>
+              <ul class="list-disc ml-5 space-y-1 text-sm">
+                <li>Create an application; fill in sections over days, on any device</li>
+                <li>Each section saves on its own and can be resumed; data can be incomplete until submit</li>
+                <li>Upload payslips, ID and bank statements; scan for malware and check type and size</li>
+                <li>Submit: validate the whole application, freeze it, hand it to assessment</li>
+                <li>See status, respond to information requests, withdraw</li>
+              </ul>
+            </div>
+          </div>
+          <div class="card card-border bg-base-100">
+            <div class="card-body">
+              <h3 class="card-title text-base">Scale (assumed)</h3>
+              <ul class="list-disc ml-5 space-y-1 text-sm">
+                <li>~50k applications a month, ~20k submissions</li>
+                <li>Peak ~100 writes/s (autosave), ~300 reads/s</li>
+                <li>Documents ~6 TB/year, ~40 TB over 7 years</li>
+                <li>99.9% availability; saves under 300 ms (p95)</li>
+              </ul>
+              <a href="#scale" class="link text-sm mt-2">Interactive calculator ↓</a>
+            </div>
+          </div>
+          <div class="card card-border bg-base-100">
+            <div class="card-body">
+              <h3 class="card-title text-base">Protecting personal data</h3>
+              <ul class="list-disc ml-5 space-y-1 text-sm">
+                <li>Data stays in Australia; Privacy Act, APRA CPS 234</li>
+                <li>TLS everywhere, KMS at rest, extra field-level encryption for TFN and ID numbers</li>
+                <li>Owner-only access for customers; role-based, audited staff access</li>
+                <li>Drafts deleted after 90 idle days; submitted kept 7 years (AML/CTF)</li>
+                <li>No personal data in logs, URLs or events</li>
+              </ul>
+              <a href="#privacy" class="link text-sm mt-2">Next deep dive ↓</a>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= SCALE ================= -->
+      <section id="scale" class="space-y-6">
+        <h2 class="text-2xl font-bold">2. Scale: interactive estimate</h2>
+        <p class="opacity-80">Move the sliders and watch the numbers and the conclusion. Start from business numbers, work down to load, then say what the load means for the design.</p>
+
+        <div class="flex flex-wrap items-center gap-3">
+          <span class="text-sm font-medium">Presets:</span>
+          <div class="join join-vertical sm:join-horizontal">
+            <button class="btn btn-sm join-item preset" data-preset="generic">Large lender (20%)</button>
+            <button class="btn btn-sm join-item preset" data-preset="cbaAll">CBA, all channels (25%)</button>
+            <button class="btn btn-sm join-item preset" data-preset="cbaDirect">CBA, direct only</button>
+          </div>
+        </div>
+
+        <div class="grid lg:grid-cols-2 gap-6">
+          <div class="card bg-base-200">
+            <div class="card-body space-y-3" id="scale-inputs"></div>
+          </div>
+
+          <div class="space-y-4">
+            <div class="stats stats-vertical sm:stats-horizontal bg-base-200 w-full">
+              <div class="stat"><div class="stat-title">Applications / month</div><div class="stat-value text-2xl" id="o-starts"></div><div class="stat-desc" id="o-starts-day"></div></div>
+              <div class="stat"><div class="stat-title">Submitted / month</div><div class="stat-value text-2xl" id="o-submitted"></div><div class="stat-desc" id="o-funded"></div></div>
+            </div>
+            <div class="stats stats-vertical sm:stats-horizontal bg-base-200 w-full">
+              <div class="stat"><div class="stat-title">Average writes/s</div><div class="stat-value text-2xl" id="o-avg"></div><div class="stat-desc">autosaves</div></div>
+              <div class="stat"><div class="stat-title">Peak writes/s</div><div class="stat-value text-2xl text-primary" id="o-peak"></div><div class="stat-desc" id="o-reads"></div></div>
+            </div>
+            <div id="o-verdict" role="alert" class="alert"></div>
+            <div class="card card-border">
+              <div class="card-body py-4">
+                <h3 class="font-semibold text-sm">The working, step by step</h3>
+                <ol class="list-decimal ml-5 text-sm space-y-1 font-mono" id="o-math"></ol>
+                <p class="text-xs opacity-70 mt-2">Shortcut: <strong>1 million a day ≈ 12 per second</strong> (a day has ~86,400 seconds).</p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid lg:grid-cols-2 gap-6">
+          <div class="card card-border"><div class="card-body">
+            <h3 class="card-title text-base">Conversion funnel</h3>
+            <div class="h-64"><canvas id="chart-funnel"></canvas></div>
+          </div></div>
+          <div class="card card-border"><div class="card-body">
+            <h3 class="card-title text-base">Writes per second vs what one Postgres can take</h3>
+            <div class="h-64"><canvas id="chart-writes"></canvas></div>
+            <p class="text-xs opacity-70">Log scale. The ceiling line (~5,000 small writes/s) is a rough, conservative figure for one well-sized Postgres primary.</p>
+          </div></div>
+        </div>
+
+        <div class="space-y-2">
+          <details class="collapse collapse-arrow bg-base-200">
+            <summary class="collapse-title font-semibold">What does "3 applications per funded loan" mean?</summary>
+            <div class="collapse-content text-sm space-y-2">
+              <p>It's a <strong>conversion funnel</strong>: for every loan that's funded, about 3 online applications were started. The rest dropped off.</p>
+              <ul class="list-disc ml-5">
+                <li><strong>Before submit:</strong> just looking, comparing rates, can't borrow enough, upload hassle, abandoned drafts.</li>
+                <li><strong>After submit:</strong> declined, low valuation, missed out on the property, went with another lender.</li>
+              </ul>
+              <p><strong>Why it matters:</strong> load comes from <em>applications</em>, not funded loans. That's why drafts expire after 90 days and files from abandoned drafts are deleted.</p>
+              <p><strong>Caveats:</strong> 14k × 3 = 42k, rounded to 50k in conversation. In Australia ~70% of home loans go through brokers, so a lender's direct online volume could be lower. Either way, the design doesn't change.</p>
+            </div>
+          </details>
+          <details class="collapse collapse-arrow bg-base-200">
+            <summary class="collapse-title font-semibold">What the numbers mean for the design (what interviewers score)</summary>
+            <div class="collapse-content text-sm">
+              <ol class="list-decimal ml-5 space-y-1">
+                <li><strong>Low traffic, high value per record.</strong> One Postgres primary with a standby is enough. Say "no sharding needed".</li>
+                <li><strong>Document volume is the real storage problem</strong>: object storage with lifecycle tiers.</li>
+                <li><strong>Plan for spikes</strong> (RBA rate decisions, end of financial year): stateless autoscaling servers, per-user rate limits, scanning behind a queue.</li>
+                <li><strong>Correctness, durability and security matter more than speed</strong>: version checks on saves, outbox, encryption.</li>
+              </ol>
+            </div>
+          </details>
+          <details class="collapse collapse-arrow bg-base-200">
+            <summary class="collapse-title font-semibold">Likely follow-up questions</summary>
+            <div class="collapse-content text-sm space-y-2">
+              <p><strong>"What if traffic is 10× higher?"</strong> ~1k writes/s: still one larger Postgres. Add read replicas, then partition by <code>application_id</code> if needed. Object storage scales without changes.</p>
+              <p><strong>"Why not NoSQL?"</strong> State change and outbox event must be one transaction; reporting needs relational queries; JSONB still gives flexible section data.</p>
+              <p><strong>"How often should autosave run?"</strong> On leaving a section, or every ~30 s while active. Per keystroke is ~10× the writes for no benefit.</p>
+            </div>
+          </details>
+          <details class="collapse collapse-arrow bg-base-200">
+            <summary class="collapse-title font-semibold">30-second script</summary>
+            <div class="collapse-content">
+              <blockquote class="border-l-4 border-base-300 pl-4 italic text-sm">"About 50k applications a month and 20k submits. Peak is around 100 writes per second, so one Postgres primary with a standby is enough. The real volume is documents, about 6 TB a year and 40 TB over the 7-year retention, so they go in object storage with lifecycle tiers. The system is low-traffic and high-stakes, so I'll put the effort into durability and data protection rather than throughput."</blockquote>
+            </div>
+          </details>
+        </div>
+      </section>
+
+      <!-- ================= API ================= -->
+      <section id="api" class="space-y-6">
+        <h2 class="text-2xl font-bold">3. API (REST, OIDC bearer token)</h2>
+        <p class="opacity-80">Every endpoint maps to something the customer sees or does. Click a path, or open a card below, to see the screen it powers and an example request and response.</p>
+        <ul class="steps steps-vertical md:steps-horizontal w-full" id="api-journey"></ul>
+        <div class="overflow-x-auto">
+          <table class="table table-zebra table-sm">
+            <thead><tr><th>Method</th><th>Path</th><th>Purpose</th></tr></thead>
+            <tbody id="api-table"></tbody>
+          </table>
+        </div>
+
+        <div id="api-walkthrough" class="space-y-10"></div>
+
+        <!-- Key headers in depth -->
+        <div id="api-headers" class="space-y-6 pt-4" style="scroll-margin-top:5rem">
+          <h3 class="text-xl font-bold">Key headers in depth</h3>
+          <div class="alert alert-soft">
+            <span><strong>Two different problems:</strong> <code>If-Match</code> stops two <em>different</em> edits overwriting each other. <code>Idempotency-Key</code> stops the <em>same</em> request taking effect twice.</span>
+          </div>
+
+          <div class="card card-border"><div class="card-body space-y-4">
+            <h4 class="card-title text-base">If-Match + ETag: no lost saves (optimistic concurrency)</h4>
+            <div class="grid md:grid-cols-2 gap-4">
+              <div>
+                <p class="text-sm font-semibold mb-1">The problem: a lost update</p>
+                <pre class="bg-base-200 rounded-box p-3 text-xs overflow-x-auto">09:00 Laptop loads Income  → version 7
+09:01 Phone loads Income   → version 7
+09:02 Phone saves 95k      → version 8  ✅
+09:03 Laptop saves (stale) → overwrites 95k with 90k ❌</pre>
+              </div>
+              <div>
+                <p class="text-sm font-semibold mb-1">The fix: send back the version you last saw</p>
+                <pre class="bg-base-200 rounded-box p-3 text-xs overflow-x-auto">GET  income          → 200  ETag: "7"   store "7"
+PUT  If-Match: "7"   → 200  ETag: "8"   store "8" ← replace it
+PUT  If-Match: "8"   → 200  ETag: "9"   store "9"
+PUT  If-Match: "9"   → 412  another device saved first</pre>
+              </div>
+            </div>
+
+            <details class="collapse collapse-arrow bg-base-200">
+              <summary class="collapse-title font-medium">What the GET response looks like</summary>
+              <div class="collapse-content space-y-3">
+                <pre class="bg-base-100 rounded-box p-3 text-xs overflow-x-auto"><code data-code="code-get-response"></code></pre>
+                <div class="overflow-x-auto"><table class="table table-sm">
+                  <thead><tr><th>Header</th><th>Purpose</th></tr></thead>
+                  <tbody>
+                    <tr><td><code>ETag: "7"</code></td><td>The section's version. Sent back as <code>If-Match</code>. Opaque to the client: a version number or a content hash. Must be <em>strong</em> (no <code>W/</code> prefix).</td></tr>
+                    <tr><td><code>Last-Modified</code></td><td>Optional and human-friendly; only accurate to the second, so don't use it for the check.</td></tr>
+                    <tr><td><code>Cache-Control: no-store</code></td><td>Personal data: nothing should cache it.</td></tr>
+                    <tr><td><code>Access-Control-Expose-Headers: ETag</code></td><td>Easy to miss: on a cross-origin API, browser JavaScript can't read <code>ETag</code> without it.</td></tr>
+                    <tr><td><code>X-Request-Id</code></td><td>Tracing and support; no personal data.</td></tr>
+                  </tbody>
+                </table></div>
+              </div>
+            </details>
+
+            <div class="grid md:grid-cols-2 gap-4">
+              <div>
+                <p class="text-sm font-semibold mb-1">Client rules</p>
+                <ol class="list-decimal ml-5 text-sm space-y-1">
+                  <li><strong>Replace the stored ETag after every successful save</strong>, or your own next autosave gets 412.</li>
+                  <li><strong>One save at a time per section.</strong> Queue them; only the newest data matters.</li>
+                  <li><strong>On 412, never auto-retry with the new ETag.</strong> That overwrites the other change. Fetch the latest and let the user choose.</li>
+                </ol>
+              </div>
+              <div>
+                <p class="text-sm font-semibold mb-1">Where the version lives</p>
+                <ul class="list-disc ml-5 text-sm space-y-1">
+                  <li><strong>Server:</strong> an integer <code>version</code> column per section; the ETag is built from it. Saves run <code>UPDATE … SET version = version + 1 WHERE … AND version = $ifMatch</code>; 0 rows → 412.</li>
+                  <li><strong>Client:</strong> in memory, next to the section's data (a ref or a query cache). Reload → just GET again.</li>
+                  <li><strong>Offline drafts:</strong> store the ETag <em>with</em> the unsaved data, so a stale draft triggers a merge prompt days later.</li>
+                  <li><strong>Not</strong> in a cookie, a global, or <code>localStorage</code> on its own.</li>
+                </ul>
+              </div>
+            </div>
+            <div class="flex flex-wrap gap-2 text-sm">
+              <span class="badge badge-soft">Version each section separately</span>
+              <span class="badge badge-soft">Optimistic, not locking: drafts stay open for days</span>
+              <span class="badge badge-soft">Missing If-Match → 428</span>
+            </div>
+          </div></div>
+
+          <div class="card card-border"><div class="card-body space-y-4">
+            <h4 class="card-title text-base">Idempotency-Key: submitting twice has the same effect as once</h4>
+            <div class="grid md:grid-cols-2 gap-4">
+              <div>
+                <p class="text-sm"><strong>The problem:</strong> the server commits the submit, but the network drops before the response arrives. The app retries, or the customer clicks again. Without a key, the retry gets a 409 (or worse, the work runs twice) and the customer sees an error for a submit that worked.</p>
+                <pre class="bg-base-200 rounded-box p-3 text-xs overflow-x-auto mt-2">POST /applications/123/submit
+Idempotency-Key: 9f1c2a7e-…   ← UUID made once per click
+→ (network drops after commit)
+
+POST /applications/123/submit
+Idempotency-Key: 9f1c2a7e-…   ← same key on retry
+→ 202 { "status": "SUBMITTED" }  ← stored first response</pre>
+              </div>
+              <div>
+                <p class="text-sm font-semibold mb-1">On the server (<code>idempotency_keys</code>, unique on user + key)</p>
+                <ol class="list-decimal ml-5 text-sm space-y-1">
+                  <li>Insert the key in the <strong>same transaction</strong> as the state change and outbox event.</li>
+                  <li>Key exists, same request hash → return the stored response.</li>
+                  <li>Key exists, different request → <strong>422</strong>.</li>
+                  <li>First request still running → <strong>409</strong>, or wait briefly.</li>
+                  <li>Delete keys after ~24 hours.</li>
+                </ol>
+              </div>
+            </div>
+            <div class="overflow-x-auto"><table class="table table-sm">
+              <thead><tr><th></th><th>If-Match (ETag)</th><th>Idempotency-Key</th></tr></thead>
+              <tbody>
+                <tr><td>Protects against</td><td>Two different edits overwriting each other</td><td>The same request applied twice</td></tr>
+                <tr><td>Used on</td><td>Saving a section (PUT)</td><td>Submit, withdraw, create (POST)</td></tr>
+                <tr><td>Client sends</td><td>The version it last read</td><td>A UUID per user action</td></tr>
+                <tr><td>On conflict</td><td>412: reload and merge</td><td>Stored response; 422 if reused for different work</td></tr>
+              </tbody>
+            </table></div>
+            <blockquote class="border-l-4 border-base-300 pl-4 italic text-sm">"ETags with If-Match give optimistic concurrency, so saves from two devices can't silently overwrite each other. Idempotency keys make submit safe to retry, which matters because mobile networks drop responses after the server has already committed."</blockquote>
+          </div></div>
+
+          <div class="space-y-2">
+            <h4 class="font-semibold">In a Next.js App Router app (Next 16, React 19, zod 4)</h4>
+            <pre class="bg-base-200 rounded-box p-3 text-xs overflow-x-auto">app/applications/[id]/income/page.tsx                 ① Server Component: reads DB, passes data + version as props
+app/api/applications/[id]/sections/[section]/route.ts ② Route Handler: GET/PUT with ETag / If-Match
+lib/sections.ts                                     ③ server-only data access (the conditional UPDATE)
+components/useSectionAutosave.ts                    ④ client hook: debounce, one save at a time, keep ETag, handle 412</pre>
+            <p class="text-sm opacity-80">First load needs no GET: the Server Component reads the database and passes <code>version</code> as a prop. ETags matter from the first save onwards.</p>
+            <details class="collapse collapse-arrow bg-base-200"><summary class="collapse-title font-medium">③ lib/sections.ts</summary>
+              <div class="collapse-content"><pre class="bg-base-100 rounded-box p-4 overflow-x-auto text-xs"><code data-code="code-next-data"></code></pre></div></details>
+            <details class="collapse collapse-arrow bg-base-200"><summary class="collapse-title font-medium">② Route Handler</summary>
+              <div class="collapse-content"><pre class="bg-base-100 rounded-box p-4 overflow-x-auto text-xs"><code data-code="code-next-route"></code></pre></div></details>
+            <details class="collapse collapse-arrow bg-base-200"><summary class="collapse-title font-medium">① Page (Server Component)</summary>
+              <div class="collapse-content"><pre class="bg-base-100 rounded-box p-4 overflow-x-auto text-xs"><code data-code="code-next-page"></code></pre></div></details>
+            <details class="collapse collapse-arrow bg-base-200"><summary class="collapse-title font-medium">④ useSectionAutosave hook</summary>
+              <div class="collapse-content"><pre class="bg-base-100 rounded-box p-4 overflow-x-auto text-xs"><code data-code="code-next-hook"></code></pre></div></details>
+            <div class="overflow-x-auto"><table class="table table-sm">
+              <thead><tr><th></th><th>Route Handler (ETag / If-Match)</th><th>Server Action (version argument)</th></tr></thead>
+              <tbody>
+                <tr><td>Other clients (mobile app, brokers)</td><td>✅ standard HTTP, 412 and 428</td><td>❌ web only</td></tr>
+                <tr><td>Boilerplate</td><td>More</td><td>Less: a typed function call</td></tr>
+                <tr><td>Use when</td><td>One API shared by app, web and brokers</td><td>The web app is the only client</td></tr>
+              </tbody>
+            </table></div>
+            <p class="text-xs opacity-70">At bank scale, Next.js is usually a backend-for-frontend: the Route Handler passes If-Match and ETag through to the application service, which owns the version check.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= STATES ================= -->
+      <section id="states" class="space-y-6">
+        <h2 class="text-2xl font-bold">4. States</h2>
+        <div class="grid lg:grid-cols-2 gap-6">
+          <div class="card card-border"><div class="card-body">
+            <h3 class="card-title text-base">Application</h3>
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> DRAFT: POST /applications
+  DRAFT --> SUBMITTED: submit
+  DRAFT --> EXPIRED: 90 days idle
+  DRAFT --> WITHDRAWN: withdraw
+  SUBMITTED --> IN_ASSESSMENT: picked up
+  SUBMITTED --> WITHDRAWN: withdraw
+  IN_ASSESSMENT --> INFO_REQUESTED: needs more info
+  INFO_REQUESTED --> IN_ASSESSMENT: customer responds
+  INFO_REQUESTED --> WITHDRAWN: withdraw
+  IN_ASSESSMENT --> APPROVED
+  IN_ASSESSMENT --> DECLINED
+</pre>
+            <ul class="list-disc ml-5 text-sm space-y-1">
+              <li>Sections can only be edited in <code>DRAFT</code>.</li>
+              <li>Submit stores an <strong>immutable copy</strong>; assessment always works from it.</li>
+              <li>In <code>INFO_REQUESTED</code>, only the requested fields or documents can be added.</li>
+            </ul>
+          </div></div>
+          <div class="card card-border"><div class="card-body">
+            <h3 class="card-title text-base">Document</h3>
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> PENDING_UPLOAD: POST /documents
+  PENDING_UPLOAD --> SCANNING: file lands in quarantine
+  SCANNING --> ACCEPTED: clean
+  SCANNING --> REJECTED: malware or invalid
+  PENDING_UPLOAD --> [*]: never uploaded, cleaned up after 24h
+</pre>
+            <ul class="list-disc ml-5 text-sm space-y-1">
+              <li>Submit is blocked while any document is still <code>PENDING_UPLOAD</code> or <code>SCANNING</code> (fail closed).</li>
+              <li>With managed scanning (GuardDuty), the database can go straight from <code>PENDING_UPLOAD</code> to <code>ACCEPTED</code>/<code>REJECTED</code>.</li>
+            </ul>
+          </div></div>
+        </div>
+      </section>
+
+      <!-- ================= OBJECT STORAGE ================= -->
+      <section id="storage" class="space-y-6">
+        <h2 class="text-2xl font-bold">5. Documents in object storage, with lifecycle tiers</h2>
+
+        <div class="grid md:grid-cols-2 gap-4">
+          <div class="card card-border"><div class="card-body">
+            <h3 class="card-title text-base">Why not keep files in Postgres?</h3>
+            <ul class="list-disc ml-5 text-sm space-y-1">
+              <li>~40 TB makes backups, restores and replication slow; failover could take hours.</li>
+              <li>Database storage costs ~5–10× more per GB.</li>
+              <li>Every upload would pass through the app servers.</li>
+            </ul>
+          </div></div>
+          <div class="card card-border"><div class="card-body">
+            <h3 class="card-title text-base">What goes where</h3>
+            <ul class="list-disc ml-5 text-sm space-y-1">
+              <li><strong>Postgres:</strong> one small row per document: <code>doc_id, application_id, type, size, sha256, storage_key, status, scan_result</code>.</li>
+              <li><strong>Object storage:</strong> the file itself.</li>
+              <li><strong>Browser uploads straight to object storage</strong> with a pre-signed URL.</li>
+            </ul>
+          </div></div>
+        </div>
+
+        <div class="grid lg:grid-cols-2 gap-6">
+          <div class="card bg-base-200"><div class="card-body space-y-3" id="storage-inputs">
+            <p class="text-xs opacity-70">Uses applications and submissions from the scale calculator above.</p>
+          </div></div>
+          <div class="space-y-4">
+            <div class="stats stats-vertical sm:stats-horizontal bg-base-200 w-full">
+              <div class="stat"><div class="stat-title">Uploaded / month</div><div class="stat-value text-2xl" id="s-month"></div><div class="stat-desc" id="s-year"></div></div>
+              <div class="stat"><div class="stat-title">Stored at year 7</div><div class="stat-value text-2xl" id="s-total"></div><div class="stat-desc">steady state</div></div>
+            </div>
+            <div class="stats stats-vertical sm:stats-horizontal bg-base-200 w-full">
+              <div class="stat"><div class="stat-title">All hot</div><div class="stat-value text-2xl" id="s-hot-cost"></div><div class="stat-desc">USD per month, approx.</div></div>
+              <div class="stat"><div class="stat-title">With tiers</div><div class="stat-value text-2xl text-success" id="s-tier-cost"></div><div class="stat-desc" id="s-saving"></div></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card card-border"><div class="card-body">
+          <h3 class="card-title text-base">Stored data by tier over 7 years</h3>
+          <div class="h-72"><canvas id="chart-storage"></canvas></div>
+        </div></div>
+
+        <div class="overflow-x-auto">
+          <table class="table table-sm">
+            <thead><tr><th>Age</th><th>How often it's read</th><th>Tier (AWS / Azure)</th><th>~$/GB/month</th></tr></thead>
+            <tbody>
+              <tr><td>0–90 days</td><td>Form being filled in; assessors open files repeatedly</td><td>S3 Standard / Hot</td><td>0.025</td></tr>
+              <tr><td>90 days – 1 year</td><td>Occasionally (customer query, loan variation)</td><td>Standard-IA / Cool</td><td>0.014</td></tr>
+              <tr><td>1–7 years</td><td>Only audits, disputes, regulators</td><td>Glacier Deep Archive / Archive</td><td>0.002</td></tr>
+              <tr><td>After 7 years</td><td>Never</td><td>Deleted</td><td>—</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="grid md:grid-cols-2 gap-3">
+          <div class="alert alert-warning alert-soft"><span><strong>Retention clock</strong> starts when the loan settles or is declined, not at upload. Tag each object with its retention date when the decision is made.</span></div>
+          <div class="alert alert-soft"><span><strong>Object Lock (compliance mode)</strong> stops anyone, admins included, deleting or changing files during retention. <strong>Legal holds</strong> override expiry during disputes.</span></div>
+          <div class="alert alert-soft"><span><strong>Archive retrieval takes hours.</strong> Fine for audits; say it out loud.</span></div>
+          <div class="alert alert-soft"><span><strong>IA tiers</strong> have minimum storage periods and retrieval fees, so don't move files there too early.</span></div>
+        </div>
+      </section>
+
+      <!-- ================= UPLOAD FLOW ================= -->
+      <section id="upload" class="space-y-6">
+        <h2 class="text-2xl font-bold">6. Upload flow</h2>
+
+        <div class="card bg-base-200"><div class="card-body">
+          <h3 class="card-title">Order of calls: API → S3 → API</h3>
+          <div class="overflow-x-auto">
+            <table class="table table-sm">
+              <thead><tr><th>#</th><th>Call</th><th>Goes to</th><th>When</th><th>Why</th></tr></thead>
+              <tbody>
+                <tr><td>①</td><td>Register files</td><td><span class="badge badge-sm">Your API</span></td><td>Right after the files are dropped (metadata only)</td><td>Check owner and state, create DB rows, get signed URLs</td></tr>
+                <tr><td>②</td><td>Upload bytes</td><td><span class="badge badge-sm badge-info">S3 directly</span></td><td>Straight after ①</td><td>Send the file without loading the API</td></tr>
+                <tr><td>③</td><td>Scan starts</td><td><span class="badge badge-sm badge-ghost">S3 → scanner</span></td><td>Automatically when each upload finishes</td><td>No client involved</td></tr>
+                <tr><td>④</td><td>Check status</td><td><span class="badge badge-sm">Your API</span></td><td>Every ~2 s until every file has a result</td><td>"Checking…", then ✅ or ❌</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="text-sm"><strong>Why the API comes first:</strong> S3 can't decide who may upload where. The API checks ownership and creates the row, so every object already has a matching row when its event fires.</p>
+        </div></div>
+
+        <div class="card card-border"><div class="card-body">
+          <h3 class="card-title text-base">Full sequence: 3 files, managed scanning</h3>
+          <div class="diagram-wide overflow-x-auto">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  actor U as Browser
+  participant API
+  participant DB as Postgres
+  participant S3 as S3 quarantine
+  participant GD as GuardDuty
+  participant Q as EventBridge + SQS
+  participant F as Finaliser Lambda
+  U->>API: POST /documents:batch (name, size, type for 3 files)
+  API->>DB: check owner and state, insert 3 rows PENDING_UPLOAD
+  API-->>U: 3 x docId + signed POST policy
+  par up to 3 uploads at a time
+    U->>S3: POST file bytes (signed)
+  end
+  Note over U: shows Checking your file...
+  S3-)GD: new object (automatic)
+  GD->>S3: tag GuardDutyMalwareScanStatus
+  GD-)Q: Object Scan Result event
+  Q->>F: deliver (retries, DLQ)
+  F->>S3: copy to clean bucket, delete from quarantine
+  F->>DB: ACCEPTED or REJECTED + outbox event
+  loop every 2 s
+    U->>API: GET /documents?ids=a,b,c
+    API-->>U: statuses
+  end
+</pre>
+          </div>
+        </div></div>
+
+        <div class="grid lg:grid-cols-2 gap-6">
+          <div class="card card-border"><div class="card-body">
+            <h3 class="card-title text-base">What is a pre-signed URL?</h3>
+            <p class="text-sm">A link to <strong>one object</strong> in a private bucket, already signed with the server's credentials. Whoever holds it can do <strong>one thing, for a limited time</strong>, without AWS credentials of their own.</p>
+            <div class="bg-base-200 rounded-box p-3 font-mono text-xs overflow-x-auto space-y-1" id="url-anatomy"></div>
+            <ol class="list-decimal ml-5 text-sm space-y-1 mt-2">
+              <li>Server signs method, bucket, key and expiry, locally, with no call to AWS.</li>
+              <li>Browser uses it to talk to S3 directly.</li>
+              <li>S3 recomputes the signature; anything changed or expired → <strong>403</strong>.</li>
+            </ol>
+            <p class="text-xs opacity-70">Caveats: anyone holding it can use it until expiry; you can't revoke one URL; never log full URLs. Azure: SAS token. GCP: signed URL.</p>
+          </div></div>
+
+          <div class="card card-border"><div class="card-body">
+            <h3 class="card-title text-base">One bucket, many keys (not a bucket per user)</h3>
+<pre class="mermaid">
+flowchart LR
+  A[User A] -->|URL signed for app-111/doc-aaa only| K1[app-111/doc-aaa]
+  B[User B] -->|URL signed for app-222/doc-ccc only| K3[app-222/doc-ccc]
+  A -. edits key to app-222 .-> X[403 signature mismatch]
+  subgraph Bucket[quarantine-bucket]
+    K1
+    K2[app-111/doc-bbb]
+    K3
+  end
+</pre>
+            <ul class="list-disc ml-5 text-sm space-y-1">
+              <li>The API checks ownership and <strong>chooses the key itself</strong>.</li>
+              <li>Users can't list the bucket or touch other keys.</li>
+              <li>A bucket per user fails: ~100 bucket default limit, config sprawl, and no added security.</li>
+              <li>Separate buckets <strong>by trust level</strong> instead: quarantine, clean, infected.</li>
+            </ul>
+          </div></div>
+        </div>
+
+        <div class="grid md:grid-cols-2 gap-3">
+          <div class="alert alert-soft"><span><strong>Pre-signed POST rather than PUT:</strong> a POST policy lets S3 enforce <code>content-length-range</code> and content type. A PUT URL can't cap the size.</span></div>
+          <div class="alert alert-soft"><span><strong>Multiple files:</strong> one API call registers all of them, then upload with at most ~3 in parallel. Each file succeeds, fails and retries on its own.</span></div>
+          <div class="alert alert-soft"><span><strong>Cap files per application</strong> (e.g. 30) plus per-user rate limits.</span></div>
+          <div class="alert alert-soft"><span><strong>Don't zip:</strong> zip bombs, harder to scan, one bad file rejects everything.</span></div>
+          <div class="alert alert-soft"><span><strong>No personal data in keys:</strong> use <code>{applicationId}/{docId}</code>, never filenames or names.</span></div>
+          <div class="alert alert-soft"><span><strong>Use the S3 event as the source of truth,</strong> not a "complete" call from the browser, which may close before sending it.</span></div>
+        </div>
+
+        <div class="space-y-2">
+          <h3 class="font-semibold">Code (TypeScript / React)</h3>
+          <details class="collapse collapse-arrow bg-base-200"><summary class="collapse-title font-medium">API: register a document and sign a POST policy</summary>
+            <div class="collapse-content"><pre class="bg-base-100 rounded-box p-4 overflow-x-auto text-xs"><code data-code="code-route"></code></pre></div></details>
+          <details class="collapse collapse-arrow bg-base-200"><summary class="collapse-title font-medium">Browser: upload with progress (XHR)</summary>
+            <div class="collapse-content"><pre class="bg-base-100 rounded-box p-4 overflow-x-auto text-xs"><code data-code="code-hook"></code></pre></div></details>
+          <details class="collapse collapse-arrow bg-base-200"><summary class="collapse-title font-medium">Multiple files: batch register + concurrency limit</summary>
+            <div class="collapse-content"><pre class="bg-base-100 rounded-box p-4 overflow-x-auto text-xs"><code data-code="code-batch"></code></pre></div></details>
+          <details class="collapse collapse-arrow bg-base-200"><summary class="collapse-title font-medium">Worker: claim a document from the queue</summary>
+            <div class="collapse-content"><pre class="bg-base-100 rounded-box p-4 overflow-x-auto text-xs"><code data-code="code-worker"></code></pre></div></details>
+        </div>
+      </section>
+
+      <!-- ================= MALWARE SCANNING ================= -->
+      <section id="scanning" class="space-y-6">
+        <h2 class="text-2xl font-bold">7. Malware scanning</h2>
+
+        <div class="alert alert-warning alert-soft">
+          <span><strong>Why scan?</strong> Uploaded files are untrusted and <strong>assessors open them on bank computers</strong>. Risks: PDFs with scripts, executables renamed <code>.pdf</code>, zip bombs, password-protected files the scanner can't open.</span>
+        </div>
+
+        <div class="overflow-x-auto">
+          <table class="table table-sm">
+            <thead><tr><th>Option</th><th>What you build</th><th>When</th></tr></thead>
+            <tbody>
+              <tr><td><strong>1. Managed</strong> (GuardDuty Malware Protection for S3 / Defender for Storage) <span class="badge badge-success badge-sm">say first</span></td><td>No scanner. AWS scans, tags the object, sends an event. A small Lambda moves the file and updates the DB.</td><td>Default: buy before you build</td></tr>
+              <tr><td><strong>2. Container service</strong> (ECS Fargate / Kubernetes)</td><td>Worker container + ClamAV sidecar (<code>clamd</code>); reads the queue, streams each file to clamd.</td><td>Own engine, CDR, custom rules</td></tr>
+              <tr><td><strong>3. Lambda + ClamAV image</strong></td><td>Same worker in Lambda</td><td>Low volume only: cold starts reload ~1 GB of signatures (10–30 s)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="card card-border"><div class="card-body">
+          <h3 class="card-title text-base">Option 1: managed (GuardDuty)</h3>
+<pre class="mermaid">
+flowchart LR
+  B[Browser] -->|upload| Q[(Quarantine bucket)]
+  Q -.->|automatic| GD[GuardDuty scan]
+  GD -->|adds tag| Q
+  GD -->|Object Scan Result| EB{{EventBridge rule}}
+  EB --> SQS[[SQS + DLQ]]
+  SQS --> F[Finaliser Lambda]
+  F -->|NO_THREATS_FOUND| C[(Clean bucket)]
+  F -->|THREATS_FOUND| I[(Infected bucket)]
+  F -->|status + outbox| DB[(Postgres)]
+  GD -->|finding| SH[Security Hub]
+</pre>
+          <div class="overflow-x-auto">
+            <table class="table table-sm">
+              <thead><tr><th>Status</th><th>Meaning</th><th>Finaliser action</th></tr></thead>
+              <tbody>
+                <tr><td><span class="badge badge-success badge-sm">NO_THREATS_FOUND</span></td><td>Clean</td><td>Optional type check from first bytes → copy to clean → <code>ACCEPTED</code> + outbox event → delete from quarantine</td></tr>
+                <tr><td><span class="badge badge-error badge-sm">THREATS_FOUND</span></td><td>Malware</td><td><code>REJECTED</code>, generic customer message, move to infected bucket or delete. GuardDuty raises a security finding automatically.</td></tr>
+                <tr><td><span class="badge badge-warning badge-sm">UNSUPPORTED</span></td><td>Couldn't scan (e.g. password-protected)</td><td><code>REJECTED</code> with an actionable reason. <strong>Fail closed.</strong></td></tr>
+                <tr><td><span class="badge badge-neutral badge-sm">ACCESS_DENIED / FAILED</span></td><td>Our IAM/KMS config is wrong, or the scan failed</td><td><strong>Don't blame the customer.</strong> Keep it pending, alert on-call, retry.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div></div>
+
+        <div class="card card-border"><div class="card-body">
+          <h3 class="card-title text-base">Option 2: build it (container + ClamAV)</h3>
+<pre class="mermaid">
+flowchart LR
+  Q[(Quarantine)] -->|ObjectCreated| SQS[[Scan queue]]
+  SQS --> W[doc-scanner worker]
+  W -->|INSTREAM tcp 3310| C[clamd sidecar]
+  SQS -. 5 failures .-> DLQ[[DLQ + alert]]
+  W --> Clean[(Clean)]
+  W --> Inf[(Infected)]
+  W --> DB[(Postgres)]
+</pre>
+          <ul class="steps steps-vertical text-sm">
+            <li class="step">Take a message; claim the row (<code>SCANNING</code>) with a conditional update</li>
+            <li class="step">Fail closed if virus definitions are older than 24 h</li>
+            <li class="step">Download from quarantine (≤ 20 MB fits in memory)</li>
+            <li class="step">Antivirus: stream bytes to ClamAV → <code>OK</code> or <code>FOUND &lt;signature&gt;</code></li>
+            <li class="step">Structure checks: first bytes match the type, no encrypted PDFs, no scripts or embedded files, no pixel bombs</li>
+            <li class="step">Optional CDR: rebuild the file without active content</li>
+            <li class="step">Sort: clean / infected / invalid; on error don't acknowledge, so it retries then goes to the DLQ</li>
+          </ul>
+          <p class="text-sm">Code layout: <code>apps/web</code>, <code>apps/api</code>, <code>services/doc-scanner</code>, <code>packages/shared</code>. The scanner deploys separately so it scales and fails on its own.</p>
+        </div></div>
+
+        <div class="grid md:grid-cols-2 gap-6">
+          <div class="card card-border"><div class="card-body">
+            <h3 class="card-title text-base">Why a queue in front of scanning?</h3>
+            <ol class="list-decimal ml-5 text-sm space-y-1">
+              <li><strong>Speed:</strong> scans take 2–30 s; the upload returns immediately.</li>
+              <li><strong>Spikes:</strong> the queue gets longer; nothing is lost. Scale workers on the age of the oldest message.</li>
+              <li><strong>Isolation:</strong> scanner down ≠ form saving down.</li>
+              <li><strong>Retries:</strong> crashed messages reappear; after ~5 attempts → DLQ + alert.</li>
+            </ol>
+            <p class="text-xs opacity-70">Sizing: 2 uploads/s × 5 s per scan ≈ 10 concurrent scans → 3–5 workers, up to ~20 in spikes. Target: 95% scanned within 60 s.</p>
+          </div></div>
+          <div class="card card-border"><div class="card-body">
+            <h3 class="card-title text-base">Correctness</h3>
+            <ul class="list-disc ml-5 text-sm space-y-1">
+              <li><strong>At-least-once delivery:</strong> scanning twice is harmless; status updates are conditional (<code>WHERE status = 'SCANNING'</code>).</li>
+              <li><strong>Fail closed:</strong> submit blocked while scanning; only the scanner reads quarantine; assessors read only the clean bucket; stale definitions stop the worker.</li>
+              <li><strong>Copy → DB → delete:</strong> a crash at any point can be retried safely; leftovers expire from quarantine after 24 h.</li>
+              <li><strong>Reconciliation job</strong> every 15 min for files stuck in <code>PENDING_UPLOAD</code> (events can be lost).</li>
+              <li><strong>Tag-based backstop:</strong> deny <code>GetObject</code> unless tag = <code>NO_THREATS_FOUND</code>.</li>
+              <li><strong>KMS:</strong> GuardDuty's role needs <code>kms:Decrypt</code>, or every scan is <code>ACCESS_DENIED</code>.</li>
+            </ul>
+          </div></div>
+        </div>
+
+        <div class="grid md:grid-cols-2 gap-6">
+          <div class="card card-border"><div class="card-body">
+            <h3 class="card-title text-base">Object tags vs metadata</h3>
+            <div class="bg-base-200 rounded-box p-3 font-mono text-xs space-y-1">
+              <div>Object: quarantine/app-111/doc-aaa</div>
+              <div>├── <strong>Data</strong>: the PDF bytes (never touched)</div>
+              <div>├── <strong>Metadata</strong>: Content-Type, size, ETag (fixed at upload)</div>
+              <div>└── <strong>Tags</strong>: GuardDutyMalwareScanStatus = NO_THREATS_FOUND (change any time)</div>
+            </div>
+            <ul class="list-disc ml-5 text-sm space-y-1 mt-2">
+              <li>Up to 10 key–value pairs per object, stored <em>next to</em> the file.</li>
+              <li>Adding a tag doesn't re-upload the file.</li>
+              <li>Bucket policies and lifecycle rules can use tags.</li>
+            </ul>
+          </div></div>
+          <div class="card card-border"><div class="card-body">
+            <h3 class="card-title text-base">EventBridge, in simple terms</h3>
+            <p class="text-sm"><strong>AWS's event router:</strong> something happens, it delivers a notice to whoever asked to hear about it. Like <code>addEventListener</code> for cloud services.</p>
+            <ol class="list-decimal ml-5 text-sm">
+              <li><strong>Event:</strong> JSON saying what happened</li>
+              <li><strong>Rule:</strong> your filter</li>
+              <li><strong>Target:</strong> Lambda, SQS, SNS, Step Functions…</li>
+            </ol>
+            <div class="overflow-x-auto mt-2">
+              <table class="table table-xs">
+                <thead><tr><th>Service</th><th>Analogy</th><th>Does</th></tr></thead>
+                <tbody>
+                  <tr><td>EventBridge</td><td>Mail-sorting room</td><td>Routes events by rules</td></tr>
+                  <tr><td>SQS</td><td>Inbox / to-do pile</td><td>Holds messages until processed; retries, DLQ</td></tr>
+                  <tr><td>SNS</td><td>Loudspeaker</td><td>Same message to many subscribers</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div></div>
+        </div>
+
+        <details class="collapse collapse-arrow bg-base-200">
+          <summary class="collapse-title font-medium">Example event and rule (JSON)</summary>
+          <div class="collapse-content grid md:grid-cols-2 gap-4">
+            <div><p class="text-sm font-semibold mb-1">Event GuardDuty sends (simplified)</p><pre class="bg-base-100 rounded-box p-3 text-xs overflow-x-auto"><code data-code="code-event"></code></pre></div>
+            <div><p class="text-sm font-semibold mb-1">Your rule: only my bucket's scan results</p><pre class="bg-base-100 rounded-box p-3 text-xs overflow-x-auto"><code data-code="code-rule"></code></pre></div>
+          </div>
+        </details>
+      </section>
+
+      <!-- ================= FAILURES ================= -->
+      <section id="failures" class="space-y-6">
+        <h2 class="text-2xl font-bold">8. Handling failures (first pass)</h2>
+        <div class="overflow-x-auto">
+          <table class="table table-zebra table-sm">
+            <thead><tr><th>Failure</th><th>How it's handled</th></tr></thead>
+            <tbody>
+              <tr><td>Two tabs or devices saving at once</td><td>Version check (<code>If-Match</code>); the losing save gets 412 with the latest data to merge</td></tr>
+              <tr><td>Upload interrupted / URL expired</td><td>Request a fresh URL for that <code>docId</code>; unused rows and objects cleaned up after 24 h</td></tr>
+              <tr><td>Scanner down</td><td>Document stays pending and blocks submit; retries with backoff; DLQ + alert</td></tr>
+              <tr><td>Customer submits twice</td><td><code>Idempotency-Key</code> returns the first result; state check rejects non-<code>DRAFT</code> submits</td></tr>
+              <tr><td>Broker or assessment system down</td><td>Submit still succeeds; event waits in the outbox; retries, then DLQ + alert</td></tr>
+              <tr><td>Duplicate events</td><td>Consumers skip event IDs they've already processed</td></tr>
+              <tr><td>Lost scan event</td><td>Reconciliation job reads the object tag and processes it, or alerts</td></tr>
+              <tr><td>Availability-zone outage</td><td>Multi-AZ Postgres with point-in-time recovery; storage replicated within Australia</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ================= CBA ================= -->
+      <section id="cba" class="space-y-6">
+        <h2 class="text-2xl font-bold">9. Framing it for CBA</h2>
+        <div class="alert alert-warning alert-soft"><span>These are rough public figures. <strong>Check them</strong> against CBA's latest results presentation and APRA's monthly banking statistics. Say "my understanding is" for anything about CBA's internal systems.</span></div>
+
+        <div class="overflow-x-auto">
+          <table class="table table-sm">
+            <thead><tr><th>Step</th><th>Rough figure</th><th>How to say it</th></tr></thead>
+            <tbody>
+              <tr><td>Market</td><td>~70k funded home loans a month, incl. refinancing</td><td>"Roughly 70k a month across Australia"</td></tr>
+              <tr><td>CBA share</td><td>~25%, the largest home lender</td><td>"≈ 17k funded a month"</td></tr>
+              <tr><td>Channels</td><td>Roughly half brokers, half direct</td><td>"Direct is about 8–9k funded a month"</td></tr>
+              <tr><td>Funnel</td><td>~3 applications per funded loan</td><td>"~25k direct applications, ~50k if the platform also takes broker submissions"</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="text-sm">Try the <a href="#scale" class="link">CBA presets</a> in the calculator.</p>
+
+        <div class="grid md:grid-cols-2 gap-6">
+          <div class="card card-border"><div class="card-body">
+            <h3 class="card-title text-base">Where you stand out</h3>
+            <ol class="list-decimal ml-5 text-sm space-y-1">
+              <li><strong>One application service for every channel</strong>: app, NetBank, branch, brokers.</li>
+              <li><strong>Most applicants are already customers:</strong> identity already verified (skip ID upload); salary visible (pre-fill income, payslips optional).</li>
+              <li><strong>Sign in with CommBank identity</strong>, step-up authentication at submit.</li>
+              <li><strong>Consumer Data Right (CDR)</strong> data from other banks instead of uploaded statements.</li>
+              <li><strong>Predictable spikes:</strong> RBA decisions, end of financial year, refinancing waves.</li>
+              <li><strong>Unloan</strong> shows CBA already invests in digital home loans (don't guess how it's built).</li>
+            </ol>
+          </div></div>
+          <div class="card card-border"><div class="card-body">
+            <h3 class="card-title text-base">Regulation to mention briefly</h3>
+            <ul class="list-disc ml-5 text-sm space-y-1">
+              <li><strong>APRA CPS 234:</strong> information security: encryption, access control, testing.</li>
+              <li><strong>APRA CPS 230:</strong> operational resilience. Origination is likely a <em>critical operation</em>: recovery targets, tolerance for disruption.</li>
+              <li><strong>NCCP responsible lending:</strong> why income and expenses must be verified (payslips).</li>
+              <li><strong>Privacy Act, AML/CTF:</strong> data minimisation, draft expiry, 7-year retention.</li>
+            </ul>
+          </div></div>
+        </div>
+
+        <details class="collapse collapse-arrow bg-base-200" open>
+          <summary class="collapse-title font-semibold">45-second script</summary>
+          <div class="collapse-content">
+            <blockquote class="border-l-4 border-base-300 pl-4 italic text-sm space-y-2">
+              <p>"Let me anchor on CBA. The market funds roughly 70k home loans a month, and CBA has about a quarter of that, so around 17k funded. If roughly 3 applications are started for every loan funded, and I build one application platform shared by the app, web, branch and broker channels, that's about 50k applications a month, peaking around 100 writes per second. That's comfortable for a single Postgres primary. The bigger issues are document storage and data protection.</p>
+              <p>CBA's advantage is that most applicants are existing customers. We've already verified their identity, and we can see their income in their accounts. So I'd pre-fill the form and make uploads the exception, using CDR data from other banks where we can. That reduces both friction and risk.</p>
+              <p>Origination is probably a critical operation under CPS 230, so I'll design for resilience: idempotent submits, an outbox for events, and multi-AZ."</p>
+            </blockquote>
+          </div>
+        </details>
+      </section>
+
+      <!-- ================= PRIVACY (NEXT) ================= -->
+      <section id="privacy" class="space-y-4">
+        <div class="flex items-center gap-3"><h2 class="text-2xl font-bold">10. Protecting personal data</h2><span class="badge badge-warning">Next deep dive</span></div>
+        <p class="opacity-80">Outline from the requirements. We'll expand this next.</p>
+        <ul class="list bg-base-200 rounded-box">
+          <li class="list-row"><span class="font-semibold">Residency</span><span>All data stays in Australian regions, backups included.</span></li>
+          <li class="list-row"><span class="font-semibold">Encryption</span><span>TLS in transit, KMS at rest, envelope/field-level encryption for TFN, ID and account numbers.</span></li>
+          <li class="list-row"><span class="font-semibold">Access</span><span>Customers see only their own applications; staff by role; every access audited.</span></li>
+          <li class="list-row"><span class="font-semibold">Minimisation</span><span>Pre-fill for existing customers; CDR instead of uploads; drafts expire after 90 days.</span></li>
+          <li class="list-row"><span class="font-semibold">Leakage</span><span>No personal data in logs, URLs, object keys or events (IDs only).</span></li>
+          <li class="list-row"><span class="font-semibold">Retention</span><span>7 years after decision, Object Lock, legal holds, then deletion.</span></li>
+        </ul>
+      </section>
+
+      <!-- ================= STUDY ================= -->
+      <section id="study" class="space-y-6">
+        <h2 class="text-2xl font-bold">11. Study mode</h2>
+
+        <div class="card bg-base-200"><div class="card-body">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <h3 class="card-title">Flashcards</h3>
+            <span class="text-sm opacity-70" id="fc-progress"></span>
+          </div>
+          <progress class="progress w-full" id="fc-bar" value="0" max="100"></progress>
+          <div class="card bg-base-100 min-h-48 cursor-pointer" id="fc-card" tabindex="0">
+            <div class="card-body">
+              <span class="badge badge-sm badge-ghost" id="fc-topic"></span>
+              <p class="text-lg font-semibold" id="fc-q"></p>
+              <div class="hidden border-t border-base-300 pt-3 text-sm space-y-1" id="fc-a"></div>
+              <p class="text-xs opacity-60 mt-auto" id="fc-hint">Click or press <kbd class="kbd kbd-xs">Space</kbd> to reveal</p>
+            </div>
+          </div>
+          <div class="flex flex-wrap gap-2 justify-between">
+            <div class="flex gap-2">
+              <button class="btn btn-sm" id="fc-prev">← Prev</button>
+              <button class="btn btn-sm" id="fc-next">Next →</button>
+            </div>
+            <div class="flex gap-2">
+              <button class="btn btn-sm btn-ghost" id="fc-shuffle">Shuffle</button>
+              <button class="btn btn-sm btn-ghost" id="fc-only-unknown">Only unknown</button>
+              <button class="btn btn-sm btn-success btn-soft" id="fc-known">I know this ✓</button>
+            </div>
+          </div>
+          <p class="text-xs opacity-60">Keys: <kbd class="kbd kbd-xs">Space</kbd> reveal, <kbd class="kbd kbd-xs">←</kbd> <kbd class="kbd kbd-xs">→</kbd> navigate, <kbd class="kbd kbd-xs">K</kbd> mark known. Progress is saved in this browser.</p>
+        </div></div>
+
+        <div class="card card-border"><div class="card-body">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <h3 class="card-title">Quick quiz</h3>
+            <div class="flex items-center gap-3"><span class="font-semibold" id="quiz-score"></span><button class="btn btn-sm btn-ghost" id="quiz-reset">Reset</button></div>
+          </div>
+          <div class="space-y-6" id="quiz"></div>
+        </div></div>
+      </section>
+
+      <!-- ================= GLOSSARY ================= -->
+      <section id="glossary" class="space-y-4">
+        <h2 class="text-2xl font-bold">12. Glossary</h2>
+        <input type="search" class="input w-full" placeholder="Filter terms…" id="glossary-filter" aria-label="Filter glossary" />
+        <div class="overflow-x-auto">
+          <table class="table table-sm table-zebra">
+            <thead><tr><th>Term</th><th>Meaning</th></tr></thead>
+            <tbody id="glossary-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <footer class="text-xs opacity-60 pb-10">Prices and market figures are approximate and for practice only.</footer>
+    </main>
+  </div>
+
+  <!-- Sidebar -->
+  <div class="drawer-side z-40">
+    <label for="nav-drawer" aria-label="Close menu" class="drawer-overlay"></label>
+    <ul class="menu bg-base-200 min-h-full w-64 p-4" id="side-menu">
+      <li class="menu-title">Home loan system design</li>
+      <li><a href="#overview">Overview</a></li>
+      <li><a href="#requirements">1. Requirements</a></li>
+      <li><a href="#scale">2. Scale</a></li>
+      <li><a href="#api">3. API</a></li>
+      <li><a href="#api-headers" class="pl-6 text-sm">Key headers</a></li>
+      <li><a href="#states">4. States</a></li>
+      <li><a href="#storage">5. Object storage</a></li>
+      <li><a href="#upload">6. Upload flow</a></li>
+      <li><a href="#scanning">7. Malware scanning</a></li>
+      <li><a href="#failures">8. Failures</a></li>
+      <li><a href="#cba">9. CBA framing</a></li>
+      <li><a href="#privacy">10. Personal data</a></li>
+      <li class="menu-title mt-2">Practice</li>
+      <li><a href="#study">11. Flashcards &amp; quiz</a></li>
+      <li><a href="#glossary">12. Glossary</a></li>
+    </ul>
+  </div>
+</div>
+
+<!-- ================= CODE SNIPPETS (plain text) ================= -->
+<script type="text/plain" id="code-route">
+// app/api/applications/[id]/documents/route.ts
+export async function POST(req: Request, ctx: { params: Promise<{ id: string }> }) {
+  const user = await requireUser(req);
+  const { id: applicationId } = await ctx.params;
+
+  const parsed = CreateDocumentRequest.safeParse(await req.json());
+  if (!parsed.success) return Response.json({ errors: parsed.error.issues }, { status: 400 });
+  const { type, filename, mimeType, size } = parsed.data;
+
+  const docId = randomUUID();
+  const key = `${applicationId}/${docId}`; // opaque IDs only: object keys end up in logs
+
+  // Ownership check, editable-state check and insert in one statement
+  const { rowCount } = await db.query(
+    `INSERT INTO documents (id, application_id, type, original_filename, mime_type, declared_size, storage_key, status)
+     SELECT $1, a.id, $3, $4, $5, $6, $7, 'PENDING_UPLOAD'
+       FROM applications a
+      WHERE a.id = $2 AND a.owner_id = $8 AND a.status IN ('DRAFT', 'INFO_REQUESTED')`,
+    [docId, applicationId, type, filename, mimeType, size, key, user.id],
+  );
+  if (rowCount === 0) return Response.json({ error: "Not found" }, { status: 404 }); // don't reveal which IDs exist
+
+  const { url, fields } = await createPresignedPost(s3, {
+    Bucket: QUARANTINE_BUCKET, Key: key, Expires: 15 * 60,
+    Fields: { "Content-Type": mimeType },
+    Conditions: [
+      ["content-length-range", size, size], // S3 rejects any other size
+      ["eq", "$Content-Type", mimeType],
+    ],
+  });
+  return Response.json({ docId, upload: { url, fields } }, { status: 201 });
+}
+</script>
+<script type="text/plain" id="code-hook">
+// fetch() can't report upload progress, so use XHR
+function postToS3(upload: CreateDocumentResponse["upload"], file: File,
+                  onProgress: (f: number) => void, signal: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    const form = new FormData();
+    for (const [k, v] of Object.entries(upload.fields)) form.append(k, v);
+    form.append("file", file); // must be the last field
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", upload.url);
+    xhr.upload.onprogress = (e) => e.lengthComputable && onProgress(e.loaded / e.total);
+    xhr.onload = () => (xhr.status < 300 ? resolve() : reject(new Error(`Upload rejected (${xhr.status})`)));
+    xhr.onerror = () => reject(new Error("Network error during upload"));
+    xhr.onabort = () => reject(new DOMException("Aborted", "AbortError"));
+    signal.addEventListener("abort", () => xhr.abort());
+    xhr.send(form);
+  });
+}
+
+// In the hook: 1) POST /documents  2) postToS3  3) poll GET /documents/{docId} every 2 s
+</script>
+<script type="text/plain" id="code-batch">
+// Server: one ownership check, one row + one signed policy per file
+const files = z.array(CreateDocumentRequest).min(1).max(10).parse(body.files);
+await db.query("BEGIN");
+const app = await db.query(
+  `SELECT id FROM applications WHERE id = $1 AND owner_id = $2
+     AND status IN ('DRAFT','INFO_REQUESTED') FOR UPDATE`, [applicationId, user.id]);
+if (app.rowCount === 0) { await db.query("ROLLBACK"); return notFound(); }
+// ... check count of existing documents against a cap (e.g. 30) ...
+const results = [];
+for (const f of files) {
+  const docId = randomUUID();
+  await insertDocument(docId, applicationId, f);                 // PENDING_UPLOAD
+  results.push({ docId, upload: await signPost(`${applicationId}/${docId}`, f) });
+}
+await db.query("COMMIT");
+
+// Client: at most 3 uploads at once, each file tracked separately
+async function runWithConcurrency<T>(items: T[], limit: number, fn: (item: T, i: number) => Promise<void>) {
+  let next = 0;
+  const worker = async () => { while (next < items.length) { const i = next++; await fn(items[i], i); } };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+}
+</script>
+<script type="text/plain" id="code-worker">
+// Lambda/worker triggered by the scan queue (S3 ObjectCreated -> SQS -> here)
+export async function handler(event: SQSEvent): Promise<SQSBatchResponse> {
+  const batchItemFailures: SQSBatchResponse["batchItemFailures"] = [];
+  for (const msg of event.Records) {
+    try {
+      const s3Event = JSON.parse(msg.body) as Partial<S3Event>;
+      for (const rec of s3Event.Records ?? []) {                 // S3 first sends a test event with no Records
+        const key = decodeURIComponent(rec.s3.object.key.replace(/\+/g, " "));
+        const [applicationId, docId] = key.split("/");
+
+        // Claim the document. SCANNING is allowed so a retry after a crash can carry on.
+        const claim = await db.query(
+          `UPDATE documents SET status = 'SCANNING', actual_size = $3
+            WHERE id = $1 AND application_id = $2 AND status IN ('PENDING_UPLOAD', 'SCANNING')`,
+          [docId, applicationId, rec.s3.object.size]);
+        if (claim.rowCount === 0) continue;                      // already decided, or unknown key
+
+        const verdict = await scanFile(rec.s3.bucket.name, key);
+        await finalise(docId, rec.s3.bucket.name, key, verdict); // UPDATE ... WHERE status = 'SCANNING'
+      }
+    } catch {
+      batchItemFailures.push({ itemIdentifier: msg.messageId }); // only this message is retried
+    }
+  }
+  return { batchItemFailures };
+}
+</script>
+<script type="text/plain" id="code-get-response">
+GET /applications/123/sections/income HTTP/1.1
+Authorization: Bearer eyJ…
+
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+ETag: "7"
+Last-Modified: Tue, 11 Nov 2026 02:41:07 GMT
+Cache-Control: no-store
+Access-Control-Expose-Headers: ETag
+X-Request-Id: 01JC8Z…
+
+{ "employmentType": "FULL_TIME", "employer": "Acme Pty Ltd",
+  "baseSalary": 95000, "payFrequency": "FORTNIGHTLY" }
+</script>
+<script type="text/plain" id="code-next-data">
+import "server-only";
+import { db } from "@/lib/db";
+
+export type Section = { data: unknown; version: number };
+
+export async function getSection(appId: string, section: string, userId: string): Promise<Section | undefined> {
+  const { rows } = await db.query(
+    `SELECT s.data, s.version
+       FROM application_sections s JOIN applications a ON a.id = s.application_id
+      WHERE s.application_id = $1 AND s.section = $2 AND a.owner_id = $3`,
+    [appId, section, userId]);
+  return rows[0];
+}
+
+export async function saveSection(appId: string, section: string, userId: string, data: unknown, expectedVersion: number) {
+  const { rows } = await db.query(
+    `UPDATE application_sections s
+        SET data = $4, version = s.version + 1, updated_at = now()
+       FROM applications a
+      WHERE s.application_id = a.id AND a.id = $1 AND s.section = $2
+        AND a.owner_id = $3 AND a.status = 'DRAFT'
+        AND s.version = $5                                   -- the If-Match check
+      RETURNING s.version`,
+    [appId, section, userId, data, expectedVersion]);
+  if (rows[0]) return { ok: true as const, version: rows[0].version as number };
+
+  const current = await getSection(appId, section, userId);
+  return current ? { ok: false as const, reason: "conflict" as const, current }
+                 : { ok: false as const, reason: "not_found" as const };
+}
+</script>
+<script type="text/plain" id="code-next-route">
+// app/api/applications/[id]/sections/[section]/route.ts
+type Ctx = { params: Promise<{ id: string; section: string }> };
+const toEtag = (v: number) => `"${v}"`;
+const fromIfMatch = (h: string | null) => { const m = h?.match(/^"(\d+)"$/); return m ? Number(m[1]) : null; };
+
+export async function GET(_req: Request, { params }: Ctx) {
+  const user = await requireUser();
+  const { id, section } = await params;
+  if (!isSectionName(section)) return Response.json({ error: "Not found" }, { status: 404 });
+  const s = await getSection(id, section, user.id);
+  if (!s) return Response.json({ error: "Not found" }, { status: 404 });
+  return Response.json(s.data, { headers: { ETag: toEtag(s.version), "Cache-Control": "no-store" } });
+}
+
+export async function PUT(req: Request, { params }: Ctx) {
+  const user = await requireUser();
+  const { id, section } = await params;
+  if (!isSectionName(section)) return Response.json({ error: "Not found" }, { status: 404 });
+
+  const expected = fromIfMatch(req.headers.get("if-match"));
+  if (expected === null) return Response.json({ error: "If-Match header required" }, { status: 428 });
+
+  const parsed = sectionSchemas[section].partial().safeParse(await req.json()); // drafts may be incomplete
+  if (!parsed.success) return Response.json({ errors: parsed.error.issues }, { status: 400 });
+
+  const result = await saveSection(id, section, user.id, parsed.data, expected);
+  if (result.ok) return new Response(null, { status: 204, headers: { ETag: toEtag(result.version) } });
+  if (result.reason === "not_found") return Response.json({ error: "Not found" }, { status: 404 });
+  return Response.json({ current: result.current.data },
+    { status: 412, headers: { ETag: toEtag(result.current.version) } });
+}
+</script>
+<script type="text/plain" id="code-next-page">
+// app/applications/[id]/income/page.tsx  (Server Component: no GET request needed)
+export default async function IncomePage({ params }: { params: Promise<{ id: string }> }) {
+  const user = await requireUser();
+  const { id } = await params;
+  const section = await getSection(id, "income", user.id);
+  if (!section) notFound();
+  return <IncomeForm applicationId={id} initialData={section.data as Partial<Income>} initialEtag={`"${section.version}"`} />;
+}
+</script>
+<script type="text/plain" id="code-next-hook">
+"use client";
+export function useSectionAutosave<T>(appId: string, section: string, initialEtag: string) {
+  const etag = useRef(initialEtag);         // a ref, not state: it's never displayed
+  const pending = useRef<T | null>(null);
+  const inFlight = useRef(false);
+  const blocked = useRef(false);            // true while a conflict is waiting for the user
+  const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const [status, setStatus] = useState<"idle" | "saving" | "saved" | "conflict" | "error">("idle");
+  const [conflict, setConflict] = useState<{ theirs: T; etag: string } | null>(null);
+
+  const flush = useCallback(async () => {
+    if (inFlight.current || blocked.current) return;
+    inFlight.current = true;
+    try {
+      while (pending.current && !blocked.current) {     // one request at a time; always the newest data
+        const body = pending.current;
+        pending.current = null;
+        setStatus("saving");
+        const res = await fetch(`/api/applications/${appId}/sections/${section}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json", "If-Match": etag.current },
+          body: JSON.stringify(body),
+        });
+        if (res.ok) { etag.current = res.headers.get("ETag")!; setStatus("saved"); }   // store the new version
+        else if (res.status === 412) {
+          blocked.current = true;                       // stop autosaving; don't overwrite their change
+          pending.current = body;
+          const { current } = await res.json();
+          setConflict({ theirs: current, etag: res.headers.get("ETag")! });
+          setStatus("conflict");
+        } else { pending.current ??= body; setStatus("error"); break; }
+      }
+    } finally { inFlight.current = false; }
+  }, [appId, section]);
+
+  const save = useCallback((data: T) => {
+    pending.current = data;
+    clearTimeout(timer.current);
+    timer.current = setTimeout(flush, 800);             // debounce typing
+  }, [flush]);
+
+  // The user picks a side; only then is the newer ETag used
+  const resolve = useCallback((choice: "mine" | "theirs") => {
+    if (!conflict) return;
+    etag.current = conflict.etag;
+    blocked.current = false;
+    setConflict(null);
+    if (choice === "theirs") { pending.current = null; setStatus("idle"); return conflict.theirs; }
+    void flush();
+  }, [conflict, flush]);
+
+  return { save, status, conflict, resolve };
+}
+</script>
+<script type="text/plain" id="code-event">
+{
+  "source": "aws.guardduty",
+  "detail-type": "GuardDuty Malware Protection Object Scan Result",
+  "detail": {
+    "s3ObjectDetails": { "bucketName": "quarantine-bucket", "objectKey": "app-111/doc-aaa" },
+    "scanResultDetails": { "scanResultStatus": "NO_THREATS_FOUND" }
+  }
+}
+</script>
+<script type="text/plain" id="code-rule">
+{
+  "source": ["aws.guardduty"],
+  "detail-type": ["GuardDuty Malware Protection Object Scan Result"],
+  "detail": { "s3ObjectDetails": { "bucketName": ["quarantine-bucket"] } }
+}
+</script>
+
+<script>
+// ---------- helpers ----------
+const $ = (id) => document.getElementById(id);
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+function fmt(n) {
+  if (!isFinite(n)) return "—";
+  if (n >= 1e6) return (n / 1e6).toFixed(1).replace(/\.0$/, "") + "M";
+  if (n >= 1e4) return Math.round(n / 1e3) + "k";
+  if (n >= 1e3) return (n / 1e3).toFixed(1).replace(/\.0$/, "") + "k";
+  if (n >= 10) return Math.round(n).toString();
+  return n.toFixed(1);
+}
+const fmtBytesGB = (gb) => gb >= 1024 ? (gb / 1024).toFixed(gb >= 10240 ? 0 : 1) + " TB" : Math.round(gb) + " GB";
+const usd = (n) => "$" + Math.round(n).toLocaleString();
+
+function themeColor(varName, alpha = 1) {
+  const v = getComputedStyle(document.documentElement).getPropertyValue(varName).trim() || "#888";
+  const c = document.createElement("canvas"); c.width = c.height = 1;
+  const x = c.getContext("2d"); x.fillStyle = v; x.fillRect(0, 0, 1, 1);
+  const [r, g, b] = x.getImageData(0, 0, 1, 1).data;
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
+// ---------- code snippets ----------
+document.querySelectorAll("code[data-code]").forEach((c) => { c.textContent = $(c.dataset.code).textContent.trim(); });
+
+// ---------- URL anatomy ----------
+[
+  ["https://my-bucket.s3.ap-southeast-2.amazonaws.com/app123/doc456", ""],
+  ["  ?X-Amz-Algorithm=AWS4-HMAC-SHA256", ""],
+  ["  &X-Amz-Credential=AKIA.../ap-southeast-2/s3/aws4_request", "← whose credentials signed it"],
+  ["  &X-Amz-Date=20261111T093600Z", ""],
+  ["  &X-Amz-Expires=900", "← valid for 15 minutes"],
+  ["  &X-Amz-Signature=3f9a...", "← signature over all of the above"],
+].forEach(([code, note]) => {
+  const row = el("div", "whitespace-pre");
+  row.append(el("span", "", code));
+  if (note) row.append(el("span", "text-primary font-semibold", "   " + note));
+  $("url-anatomy").append(row);
+});
+
+// ---------- API walkthrough ----------
+const apiGroups = [
+  ["start", "Start & resume"],
+  ["fill", "Fill in"],
+  ["docs", "Documents"],
+  ["submit", "Review & submit"],
+  ["after", "After submit"],
+];
+const apiDetails = [
+  { g: "start", m: "POST", p: "/applications", short: "Create a draft",
+    purpose: "Creates an empty draft application and returns its ID, so the customer lands on the first section.",
+    when: "The customer clicks \"Start application\" after choosing what the loan is for.",
+    ui: `┌ Let's get started ─────────────────────┐
+│ What's the loan for?                   │
+│ ( ) Buying a home to live in           │
+│ ( ) Buying an investment property      │
+│ (•) Refinancing my current loan        │
+│                          [Start →]     │
+└────────────────────────────────────────┘`,
+    req: `POST /applications
+Idempotency-Key: 4b7e…
+{ "purpose": "REFINANCE" }`,
+    res: `201 Created
+Location: /applications/app-111
+{ "id": "app-111", "status": "DRAFT", "nextSection": "applicants" }`,
+    notes: ["Check the list endpoint first and offer to continue an existing draft.", "Idempotency-Key stops a double-click creating two drafts.", "Creates every section row with {} and version 1."] },
+
+  { g: "start", m: "GET", p: "/applications?status=", short: "List my applications",
+    purpose: "Finds the customer's applications so they can resume a draft on any device, see what needs action, and track progress.",
+    when: "\"My home loans\" screen, the app home screen's \"Continue\" card, and before creating a new draft.",
+    ui: `┌ My home loan applications      [+ New] ┐
+│ ⚠ ACTION NEEDED                         │
+│  Investment · Submitted 3 Nov           │
+│  We need your latest payslip [Upload →] │
+│ CONTINUE WHERE YOU LEFT OFF             │
+│  Refinance · Draft                      │
+│  ██████████░░░░░ 5 of 8 sections        │
+│  Next: Expenses · Saved 2 days ago      │
+│  Expires in 88 days        [Continue →] │
+│ IN PROGRESS                             │
+│  Purchase · In assessment  [View →]     │
+└─────────────────────────────────────────┘`,
+    req: `GET /applications?status=DRAFT,INFO_REQUESTED,SUBMITTED,IN_ASSESSMENT`,
+    res: `200 OK
+{ "items": [
+  { "id": "app-222", "status": "INFO_REQUESTED", "purpose": "INVESTMENT",
+    "actionRequired": { "type": "DOCUMENT", "documentType": "PAYSLIP" } },
+  { "id": "app-111", "status": "DRAFT", "purpose": "REFINANCE",
+    "progress": { "completed": 5, "total": 8, "nextSection": "expenses" },
+    "updatedAt": "2026-11-09T…", "expiresAt": "2027-02-07T…" }
+], "nextCursor": null }`,
+    notes: ["Summaries only, never full form data.", "Always the signed-in user's own (WHERE owner_id = :user); no ?userId= to tamper with.", "Store progress on the application row; index (owner_id, status, updated_at DESC); cursor pagination."] },
+
+  { g: "start", m: "GET", p: "/applications/{id}", short: "Application overview",
+    purpose: "The application's shell: status, which sections are complete, document summary and expiry. Drives the stepper and the read-only view after submit.",
+    when: "Opening an application; rendering the side stepper; viewing a submitted application.",
+    ui: `┌ Refinance application ────────────────┐
+│ ✓ About you                           │
+│ ✓ Income                              │
+│ ● Expenses          ← you are here    │
+│ ○ Assets & debts                      │
+│ ○ Property                            │
+│ ○ Documents                           │
+│ ○ Review & submit                     │
+└───────────────────────────────────────┘`,
+    req: `GET /applications/app-111`,
+    res: `200 OK
+ETag: "42"
+{ "id": "app-111", "status": "DRAFT", "purpose": "REFINANCE",
+  "sections": { "applicants": { "complete": true, "version": 3 },
+                "income": { "complete": true, "version": 8 },
+                "expenses": { "complete": false, "version": 2 } },
+  "documents": { "accepted": 2, "pending": 1 },
+  "expiresAt": "2027-02-07T…" }`,
+    notes: ["Per-section versions let the client build each section's If-Match.", "After submit, this returns the frozen copy."] },
+
+  { g: "fill", m: "GET", p: "/applications/{id}/sections/{section}", short: "Load one section",
+    purpose: "Loads one step's form data plus its version (ETag).",
+    when: "Opening a step in a client-rendered app. In Next.js, a Server Component can read the DB directly instead.",
+    ui: `┌ Income ───────────────────────────────┐
+│ Employment   [ Full time        ▾]    │
+│ Employer     [ Acme Pty Ltd       ]   │
+│ Base salary  [ 95,000             ]   │
+│ Pay cycle    [ Fortnightly      ▾]    │
+└───────────────────────────────────────┘`,
+    req: `GET /applications/app-111/sections/income`,
+    res: `200 OK
+ETag: "7"
+Cache-Control: no-store
+{ "employmentType": "FULL_TIME", "employer": "Acme Pty Ltd",
+  "baseSalary": 95000, "payFrequency": "FORTNIGHTLY" }`,
+    notes: ["Store the ETag next to the data; send it back as If-Match."] },
+
+  { g: "fill", m: "PUT", p: "/applications/{id}/sections/{section}", short: "Save one section (autosave)",
+    purpose: "Saves a section. Drafts may be incomplete, so validation is lenient (types and formats, not required fields).",
+    when: "Autosave: on leaving a field or section, or every ~30 s while typing (debounced).",
+    ui: `  Base salary  [ 95,000      ]
+  Pay cycle    [ Fortnightly ▾]
+                            ✓ Saved
+
+  ⚠ This section was changed on another device.
+    [Use theirs]  [Keep mine]          ← on 412`,
+    req: `PUT /applications/app-111/sections/income
+If-Match: "7"
+{ "baseSalary": 95000, "payFrequency": "FORTNIGHTLY" }`,
+    res: `204 No Content
+ETag: "8"
+
+— or, if someone saved first —
+412 Precondition Failed
+ETag: "9"
+{ "current": { "baseSalary": 98000 } }`,
+    notes: ["Replace the stored ETag with the new one.", "One save at a time per section.", "Missing If-Match → 428."] },
+
+  { g: "docs", m: "POST", p: "/applications/{id}/documents", short: "Register one document",
+    purpose: "Checks ownership and state, creates a PENDING_UPLOAD row, returns a signed upload policy for the quarantine bucket.",
+    when: "The customer picks a single file, e.g. photo ID.",
+    ui: `  Photo ID   [ Choose file ]
+             Driver licence or passport
+             PDF, JPG or PNG, up to 20 MB`,
+    req: `POST /applications/app-111/documents
+{ "type": "PHOTO_ID", "filename": "licence.jpg",
+  "mimeType": "image/jpeg", "size": 1834221 }`,
+    res: `201 Created
+{ "docId": "doc-aaa",
+  "upload": { "url": "https://quarantine…amazonaws.com",
+              "fields": { "key": "app-111/doc-aaa", "Policy": "…", … },
+              "expiresAt": "…+15 min" } }`,
+    notes: ["The API chooses the key: {applicationId}/{docId}, no filenames.", "POST policy enforces exact size and type."] },
+
+  { g: "docs", m: "POST", p: "/applications/{id}/documents:batch", short: "Register several documents",
+    purpose: "Same as above for several files in one call: one ownership check, one row and one signed policy per file.",
+    when: "The customer drops several payslips at once.",
+    ui: `┌ Payslips (last 2) ─────────────────────┐
+│    Drag files here or [Browse]         │
+│  payslip-oct.pdf   ████████░░  80%     │
+│  payslip-nov.pdf   ███░░░░░░░  30%     │
+└────────────────────────────────────────┘`,
+    req: `POST /applications/app-111/documents:batch
+{ "files": [ { "type": "PAYSLIP", "filename": "payslip-oct.pdf", … },
+             { "type": "PAYSLIP", "filename": "payslip-nov.pdf", … } ] }`,
+    res: `201 Created
+[ { "docId": "doc-bbb", "upload": { … } },
+  { "docId": "doc-ccc", "upload": { … } } ]`,
+    notes: ["Cap files per application (e.g. 30).", "Client uploads at most ~3 at a time; each file succeeds or fails on its own."] },
+
+  { g: "docs", m: "POST", p: "(pre-signed S3 URL)", short: "Upload the bytes to S3",
+    purpose: "The browser sends the file straight to the quarantine bucket. Your API isn't involved.",
+    when: "Immediately after registering. This is what the progress bar shows.",
+    ui: `  payslip-oct.pdf   ████████░░  80%`,
+    req: `POST https://quarantine-bucket.s3.ap-southeast-2.amazonaws.com
+multipart/form-data: key, Policy, X-Amz-Signature, …, file (last)`,
+    res: `204 No Content   (or 403 if expired, tampered, or wrong size)`,
+    notes: ["Use XHR for progress events; fetch() can't report upload progress.", "Completion triggers the scan automatically (S3 event or GuardDuty)."] },
+
+  { g: "docs", m: "GET", p: "/applications/{id}/documents?ids=", short: "Document statuses",
+    purpose: "Polls scan results for the files just uploaded; without ?ids= it lists all documents for the Documents checklist.",
+    when: "Every ~2 s after upload until each file is ACCEPTED or REJECTED; when opening the Documents step.",
+    ui: `  payslip-oct.pdf  ⏳ Checking…
+  payslip-nov.pdf  ✓ Accepted
+  scan.pdf         ✗ Password-protected. Upload a version
+                     without a password         [Replace]`,
+    req: `GET /applications/app-111/documents?ids=doc-bbb,doc-ccc,doc-ddd`,
+    res: `200 OK
+[ { "docId": "doc-bbb", "status": "SCANNING" },
+  { "docId": "doc-ccc", "status": "ACCEPTED" },
+  { "docId": "doc-ddd", "status": "REJECTED", "reason": "ENCRYPTED_PDF" } ]`,
+    notes: ["One request covers every file.", "Server-Sent Events could replace polling later."] },
+
+  { g: "docs", m: "POST", p: "/applications/{id}/documents/{docId}/upload-url", short: "Fresh upload URL",
+    purpose: "Issues a new signed policy for an existing document when the old one expired or the upload failed.",
+    when: "The customer clicks Retry on a failed upload.",
+    ui: `  payslip-oct.pdf  ✗ Upload interrupted     [Retry]`,
+    req: `POST /applications/app-111/documents/doc-bbb/upload-url`,
+    res: `200 OK
+{ "upload": { "url": "…", "fields": { … }, "expiresAt": "…" } }`,
+    notes: ["Only for documents still PENDING_UPLOAD.", "Avoids creating orphan rows on every retry."] },
+
+  { g: "docs", m: "DELETE", p: "/applications/{id}/documents/{docId}", short: "Remove a document",
+    purpose: "Removes a document from a draft (wrong file, duplicate).",
+    when: "The trash icon next to a file.",
+    ui: `  payslip-sep.pdf  ✓ Accepted        [🗑 Remove]
+  ┌ Remove this payslip? ──────────────┐
+  │              [Cancel] [Remove]     │
+  └────────────────────────────────────┘`,
+    req: `DELETE /applications/app-111/documents/doc-eee`,
+    res: `204 No Content   (409 if the application is no longer a draft)`,
+    notes: ["Soft-delete the row; delete the object (or let lifecycle remove it).", "A scan finishing later must not resurrect it: conditional updates handle that."] },
+
+  { g: "submit", m: "GET", p: "/applications/{id}/validation", short: "What's missing",
+    purpose: "Runs the full submit rules without submitting, so the Review page can list problems and disable Submit.",
+    when: "Opening Review & submit, and after each fix.",
+    ui: `┌ Review & submit ──────────────────────────┐
+│ Almost there. Fix 3 things:               │
+│ ⚠ Expenses: groceries missing      [Fix]  │
+│ ⚠ Documents: 2nd payslip needed  [Upload] │
+│ ⏳ Documents: 1 file still checking        │
+│ [Submit application]   (disabled)         │
+└───────────────────────────────────────────┘`,
+    req: `GET /applications/app-111/validation`,
+    res: `200 OK
+{ "ready": false, "problems": [
+  { "section": "expenses", "field": "groceries", "code": "REQUIRED" },
+  { "section": "documents", "code": "PAYSLIP_COUNT", "required": 2, "have": 1 },
+  { "section": "documents", "code": "SCAN_PENDING", "docId": "doc-bbb" } ] }`,
+    notes: ["Share one validation module with submit, so its 422 matches exactly.", "Return codes, not just messages, so the UI can link to the right field."] },
+
+  { g: "submit", m: "POST", p: "/applications/{id}/submit", short: "Submit",
+    purpose: "Validates everything, records the declaration and consent, freezes an immutable copy, moves to SUBMITTED and writes the outbox event, in one transaction.",
+    when: "The customer ticks the declaration and clicks Submit (with step-up authentication).",
+    ui: `┌ Declaration ──────────────────────────┐
+│ [✓] The information I've given is true│
+│ [✓] I consent to a credit check       │
+│               [Submit application]    │
+└───────────────────────────────────────┘
+                 ↓ 202
+┌───────────────────────────────────────┐
+│ ✓ Application submitted               │
+│ Reference HL-2026-48213               │
+│ We'll be in touch in 3–5 business days│
+└───────────────────────────────────────┘`,
+    req: `POST /applications/app-111/submit
+Idempotency-Key: 9f1c2a7e-…
+{ "declarationAccepted": true, "creditCheckConsent": true }`,
+    res: `202 Accepted
+{ "status": "SUBMITTED", "reference": "HL-2026-48213" }
+
+— or —
+422 Unprocessable Entity
+{ "problems": [ … same shape as /validation … ] }`,
+    notes: ["Idempotency-Key makes retries return the same 202.", "Blocked while any document is still scanning (fail closed).", "202, not 200: assessment happens asynchronously."] },
+
+  { g: "after", m: "GET", p: "/applications/{id}/requests", short: "Information requests",
+    purpose: "Lists what the assessor needs from the customer while the application is INFO_REQUESTED.",
+    when: "The \"Action needed\" card, or a push or email notification linking here.",
+    ui: `┌ We need a few more things ──────────────┐
+│ 1. Latest payslip (after 1 Nov) [Upload] │
+│ 2. Explain the $20k deposit on 3 Oct     │
+│    [ text box                       ]    │
+│                       [Send response]    │
+└──────────────────────────────────────────┘`,
+    req: `GET /applications/app-222/requests`,
+    res: `200 OK
+[ { "id": "req-1", "type": "DOCUMENT", "documentType": "PAYSLIP",
+    "message": "Latest payslip dated after 1 Nov", "status": "OPEN" },
+  { "id": "req-2", "type": "EXPLANATION",
+    "message": "Explain the $20,000 deposit on 3 Oct", "status": "OPEN" } ]`,
+    notes: ["Document requests are answered by uploading with a requestId.", "Text answers need their own endpoint (next row)."] },
+
+  { g: "after", m: "POST", p: "/applications/{id}/requests/{requestId}/response", short: "Answer a request",
+    purpose: "Records the customer's answer to an information request; when all are answered, the application returns to IN_ASSESSMENT.",
+    when: "Send response on an explanation request.",
+    ui: `  2. Explain the $20k deposit on 3 Oct
+     [ Gift from my parents for the deposit ]
+                              [Send response]`,
+    req: `POST /applications/app-222/requests/req-2/response
+Idempotency-Key: 77aa…
+{ "text": "Gift from my parents for the deposit" }`,
+    res: `201 Created
+{ "requestId": "req-2", "status": "ANSWERED", "applicationStatus": "INFO_REQUESTED" }`,
+    notes: ["Added during the walkthrough: the original list had no way to send a text answer.", "Writes an outbox event so the assessor is notified."] },
+
+  { g: "after", m: "POST", p: "/applications/{id}/withdraw", short: "Withdraw",
+    purpose: "Stops the application. Allowed from DRAFT, SUBMITTED and INFO_REQUESTED.",
+    when: "\"Withdraw application\" in an overflow menu, with a confirmation.",
+    ui: `  [⋯] → Withdraw application
+  ┌ Withdraw this application? ──────────┐
+  │ Reason [ Went with another lender ▾] │
+  │ This can't be undone.                │
+  │              [Cancel] [Withdraw]     │
+  └──────────────────────────────────────┘`,
+    req: `POST /applications/app-111/withdraw
+Idempotency-Key: 1c9d…
+{ "reason": "OTHER_LENDER" }`,
+    res: `200 OK
+{ "status": "WITHDRAWN" }`,
+    notes: ["Outbox event tells assessment to stop.", "The reason feeds funnel analytics.", "Retention rules then apply as for a decision."] },
+];
+
+const methodBadge = { GET: "badge-info", POST: "badge-success", PUT: "badge-warning", DELETE: "badge-error" };
+const slug = (d) => "api-" + (d.m + d.p).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+
+apiGroups.forEach(([g, label], i) => {
+  const li = el("li", "step cursor-pointer", label);
+  li.setAttribute("data-content", String(i + 1));
+  li.addEventListener("click", () => $("api-group-" + g).scrollIntoView({ behavior: "smooth" }));
+  $("api-journey").append(li);
+});
+
+apiDetails.forEach((d) => {
+  const tr = el("tr");
+  const td = el("td"); td.append(el("span", `badge badge-sm badge-soft ${methodBadge[d.m]}`, d.m));
+  const pathTd = el("td"); const a = el("a", "font-mono text-xs link link-hover", d.p); a.href = "#" + slug(d);
+  a.addEventListener("click", () => { const det = $(slug(d)); if (det) det.open = true; });
+  pathTd.append(a);
+  tr.append(td, pathTd, el("td", "text-sm", d.short));
+  $("api-table").append(tr);
+});
+const headersRow = el("tr"); const hTd = el("td"); hTd.colSpan = 3;
+const hLink = el("a", "link text-sm", "Key headers in depth: If-Match / ETag and Idempotency-Key ↓"); hLink.href = "#api-headers";
+hTd.append(hLink); headersRow.append(hTd); $("api-table").append(headersRow);
+
+apiGroups.forEach(([g, label], i) => {
+  const wrap = el("div", "space-y-2"); wrap.id = "api-group-" + g; wrap.style.scrollMarginTop = "5rem";
+  wrap.append(el("h3", "text-lg font-semibold", `${i + 1}. ${label}`));
+  apiDetails.filter((d) => d.g === g).forEach((d) => {
+    const det = el("details", "collapse collapse-arrow bg-base-200"); det.id = slug(d); det.style.scrollMarginTop = "5rem";
+    const sum = el("summary", "collapse-title");
+    const line = el("div", "flex flex-wrap items-center gap-2");
+    line.append(el("span", `badge badge-sm badge-soft ${methodBadge[d.m]}`, d.m), el("span", "font-mono text-sm break-all", d.p), el("span", "text-sm opacity-70", "— " + d.short));
+    sum.append(line);
+    const body = el("div", "collapse-content grid lg:grid-cols-2 gap-4");
+    const left = el("div", "space-y-3 text-sm");
+    const p1 = el("p"); p1.append(el("strong", "", "Purpose: "), document.createTextNode(d.purpose));
+    const p2 = el("p"); p2.append(el("strong", "", "When it's called: "), document.createTextNode(d.when));
+    left.append(p1, p2);
+    if (d.notes?.length) { const ul = el("ul", "list-disc ml-5 space-y-1"); d.notes.forEach((n) => ul.append(el("li", "", n))); left.append(ul); }
+    left.append(el("p", "text-xs font-semibold mt-2", "Request"), el("pre", "bg-base-100 rounded-box p-3 text-xs overflow-x-auto", d.req));
+    left.append(el("p", "text-xs font-semibold", "Response"), el("pre", "bg-base-100 rounded-box p-3 text-xs overflow-x-auto", d.res));
+    const right = el("div", "space-y-2");
+    right.append(el("p", "text-xs font-semibold", "Example UI"), el("pre", "bg-base-100 rounded-box p-3 text-xs overflow-x-auto leading-snug", d.ui));
+    body.append(left, right);
+    det.append(sum, body);
+    wrap.append(det);
+  });
+  $("api-walkthrough").append(wrap);
+});
+if (location.hash.startsWith("#api-")) { const t = document.querySelector(location.hash); if (t?.tagName === "DETAILS") t.open = true; }
+
+// ---------- slider factory ----------
+function slider(container, { id, label, min, max, step = 1, value, unit = "", help }) {
+  const wrap = el("div");
+  const head = el("div", "flex justify-between text-sm");
+  head.append(el("label", "font-medium", label));
+  const out = el("span", "font-mono", ""); out.id = id + "-val"; head.append(out);
+  const input = Object.assign(document.createElement("input"), { type: "range", min, max, step, value, id, className: "range range-sm w-full" });
+  input.setAttribute("aria-label", label);
+  wrap.append(head, input);
+  if (help) wrap.append(el("p", "text-xs opacity-60", help));
+  container.append(wrap);
+  const show = () => (out.textContent = (Number(input.value) >= 1000 ? fmt(Number(input.value)) : input.value) + unit);
+  input.addEventListener("input", () => { show(); recalc(); });
+  show();
+  return input;
+}
+const setSlider = (id, v) => { const s = $(id); s.value = v; s.dispatchEvent(new Event("input")); };
+
+const scaleIn = $("scale-inputs");
+slider(scaleIn, { id: "market", label: "Market: funded home loans / month", min: 30000, max: 120000, step: 5000, value: 70000 });
+slider(scaleIn, { id: "share", label: "Lender's market share", min: 5, max: 40, value: 20, unit: "%" });
+slider(scaleIn, { id: "channel", label: "Share of that lender's loans through this platform", min: 20, max: 100, step: 5, value: 100, unit: "%", help: "100% = one platform for app, web, branch and brokers. ~50% = direct channels only." });
+slider(scaleIn, { id: "spf", label: "Applications per funded loan", min: 1.5, max: 6, step: 0.5, value: 3 });
+slider(scaleIn, { id: "submit", label: "Applications that get submitted", min: 10, max: 80, step: 5, value: 40, unit: "%" });
+slider(scaleIn, { id: "saves", label: "Autosaves per application", min: 20, max: 300, step: 10, value: 100, help: "~10 sections × ~10 saves each, over several visits." });
+slider(scaleIn, { id: "busy", label: "Busy-hour multiplier", min: 2, max: 20, value: 10, unit: "×", help: "Most people apply in the evening." });
+slider(scaleIn, { id: "spike", label: "Spike-day multiplier", min: 1, max: 10, value: 5, unit: "×", help: "RBA rate decisions, end of financial year." });
+
+const storeIn = $("storage-inputs");
+slider(storeIn, { id: "upl", label: "Applications that upload documents", min: 20, max: 100, step: 5, value: 60, unit: "%" });
+slider(storeIn, { id: "docs", label: "Documents per application", min: 2, max: 20, value: 8 });
+slider(storeIn, { id: "mb", label: "Average file size", min: 0.5, max: 10, step: 0.5, value: 2, unit: " MB" });
+const tw = el("label", "flex items-center gap-3 text-sm cursor-pointer");
+const delToggle = Object.assign(document.createElement("input"), { type: "checkbox", className: "toggle toggle-sm", checked: true, id: "del-abandoned" });
+tw.append(delToggle, el("span", "", "Delete files from abandoned drafts after 90 days"));
+storeIn.append(tw);
+delToggle.addEventListener("change", () => recalc());
+
+document.querySelectorAll(".preset").forEach((b) => b.addEventListener("click", () => {
+  const p = { generic: { share: 20, channel: 100 }, cbaAll: { share: 25, channel: 100 }, cbaDirect: { share: 25, channel: 50 } }[b.dataset.preset];
+  setSlider("market", 70000); setSlider("spf", 3); setSlider("submit", 40);
+  setSlider("share", p.share); setSlider("channel", p.channel);
+  document.querySelectorAll(".preset").forEach((x) => x.classList.toggle("btn-active", x === b));
+}));
+
+// ---------- charts ----------
+let charts = {};
+function buildCharts() {
+  Object.values(charts).forEach((c) => c.destroy());
+  const text = themeColor("--color-base-content", 0.8), grid = themeColor("--color-base-content", 0.1);
+  Chart.defaults.color = text; Chart.defaults.borderColor = grid;
+
+  charts.funnel = new Chart($("chart-funnel"), {
+    type: "bar",
+    data: { labels: ["Applications", "Submitted", "Funded"], datasets: [{ data: [0, 0, 0], backgroundColor: [themeColor("--color-info", 0.8), themeColor("--color-accent", 0.8), themeColor("--color-success", 0.8)], borderRadius: 6 }] },
+    options: { indexAxis: "y", maintainAspectRatio: false, plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c) => fmt(c.raw) + " / month" } } }, scales: { x: { ticks: { callback: (v) => fmt(v) } } } },
+  });
+
+  charts.writes = new Chart($("chart-writes"), {
+    type: "bar",
+    data: {
+      labels: ["Average", "Busy hour", "Spike day", "Reads at spike"],
+      datasets: [
+        { label: "per second", data: [0, 0, 0, 0], backgroundColor: [themeColor("--color-info", 0.7), themeColor("--color-warning", 0.7), themeColor("--color-error", 0.7), themeColor("--color-accent", 0.7)], borderRadius: 6 },
+        { type: "line", label: "Rough single-Postgres ceiling", data: [5000, 5000, 5000, 5000], borderColor: themeColor("--color-success"), borderDash: [6, 6], pointRadius: 0 },
+      ],
+    },
+    options: { maintainAspectRatio: false, plugins: { tooltip: { callbacks: { label: (c) => c.dataset.label + ": " + fmt(c.raw) } } }, scales: { y: { type: "logarithmic", min: 0.5, max: 20000, ticks: { callback: (v) => ([1, 10, 100, 1000, 10000].includes(v) ? fmt(v) : "") } } } },
+  });
+
+  const months = Array.from({ length: 84 }, (_, i) => i + 1);
+  const ds = (label, v) => ({ label, data: [], fill: true, borderColor: themeColor(v), backgroundColor: themeColor(v, 0.35), pointRadius: 0, tension: 0.2 });
+  charts.storage = new Chart($("chart-storage"), {
+    type: "line",
+    data: { labels: months, datasets: [ds("Hot (0–90 days)", "--color-error"), ds("Infrequent access (3–12 months)", "--color-warning"), ds("Archive (1–7 years)", "--color-info")] },
+    options: {
+      maintainAspectRatio: false, interaction: { mode: "index", intersect: false },
+      plugins: { tooltip: { callbacks: { title: (i) => `Month ${i[0].label}`, label: (c) => `${c.dataset.label}: ${fmtBytesGB(c.raw)}` } } },
+      scales: {
+        x: { ticks: { autoSkip: false, maxRotation: 0, callback: (v, i) => ((i + 1) % 12 === 0 ? `Year ${(i + 1) / 12}` : "") } },
+        y: { stacked: true, ticks: { callback: (v) => fmtBytesGB(v) } },
+      },
+    },
+  });
+  recalc();
+}
+
+function recalc() {
+  if (!charts.funnel) return;
+  const v = (id) => Number($(id).value);
+  const funded = v("market") * v("share") / 100 * v("channel") / 100;
+  const starts = funded * v("spf");
+  const submitted = starts * v("submit") / 100;
+  const savesMonth = starts * v("saves");
+  const avg = savesMonth / (30 * 86400);
+  const busy = avg * v("busy");
+  const peak = busy * v("spike");
+  const reads = peak * 3;
+
+  $("o-starts").textContent = fmt(starts);
+  $("o-starts-day").textContent = `≈ ${fmt(starts / 30)} a day`;
+  $("o-submitted").textContent = fmt(submitted);
+  $("o-funded").textContent = funded > submitted ? `⚠ funded (${fmt(funded)}) > submitted` : `${fmt(funded)} funded (${Math.round(funded / submitted * 100)}% of submitted)`;
+  $("o-avg").textContent = fmt(avg);
+  $("o-peak").textContent = fmt(peak);
+  $("o-reads").textContent = `reads ≈ ${fmt(reads)}/s`;
+
+  const verdict = $("o-verdict");
+  verdict.className = "alert " + (peak < 1000 ? "alert-success" : peak < 5000 ? "alert-info" : "alert-warning");
+  verdict.textContent = peak < 1000
+    ? `Peak ≈ ${fmt(peak)} writes/s: one Postgres primary + standby is plenty. No sharding.`
+    : peak < 5000
+      ? `Peak ≈ ${fmt(peak)} writes/s: still one (bigger) Postgres; add read replicas.`
+      : `Peak ≈ ${fmt(peak)} writes/s: consider partitioning by application_id or scaling out writes.`;
+
+  const math = $("o-math"); math.replaceChildren();
+  [
+    `${fmt(v("market"))} × ${v("share")}% × ${v("channel")}% = ${fmt(funded)} funded`,
+    `${fmt(funded)} × ${v("spf")} = ${fmt(starts)} applications`,
+    `${fmt(starts)} × ${v("saves")} saves = ${fmt(savesMonth)} saves/month`,
+    `÷ 30 days ÷ 86,400 s = ${fmt(avg)}/s average`,
+    `× ${v("busy")} busy hour = ${fmt(busy)}/s`,
+    `× ${v("spike")} spike day = ${fmt(peak)}/s`,
+  ].forEach((t) => math.append(el("li", "", t)));
+
+  charts.funnel.data.datasets[0].data = [starts, submitted, funded];
+  charts.funnel.update();
+  charts.writes.data.datasets[0].data = [avg, busy, peak, reads];
+  charts.writes.update();
+
+  // storage
+  const uploaders = starts * v("upl") / 100;
+  const monthlyGB = uploaders * v("docs") * v("mb") / 1024;
+  const retainedGB = delToggle.checked ? Math.min(submitted, uploaders) * v("docs") * v("mb") / 1024 : monthlyGB;
+  const hot = [], ia = [], arch = [];
+  for (let m = 1; m <= 84; m++) {
+    hot.push(monthlyGB * Math.min(m, 3));
+    ia.push(retainedGB * Math.max(0, Math.min(m - 3, 9)));
+    arch.push(retainedGB * Math.max(0, Math.min(m - 12, 72)));
+  }
+  const total = hot[83] + ia[83] + arch[83];
+  const tierCost = hot[83] * 0.025 + ia[83] * 0.0138 + arch[83] * 0.002;
+  const hotCost = total * 0.025;
+  $("s-month").textContent = fmtBytesGB(monthlyGB);
+  $("s-year").textContent = `≈ ${fmtBytesGB(monthlyGB * 12)} a year uploaded`;
+  $("s-total").textContent = fmtBytesGB(total);
+  $("s-hot-cost").textContent = usd(hotCost);
+  $("s-tier-cost").textContent = usd(tierCost);
+  $("s-saving").textContent = `${Math.round((1 - tierCost / hotCost) * 100)}% cheaper`;
+  charts.storage.data.datasets[0].data = hot;
+  charts.storage.data.datasets[1].data = ia;
+  charts.storage.data.datasets[2].data = arch;
+  charts.storage.update();
+}
+
+// ---------- flashcards ----------
+const cards = [
+  ["Scale", "What's the peak write rate, and why is it fine?", "~100 writes/s (2/s average × 10 busy hour × 5 spike day). One Postgres handles thousands of small writes/s, so no sharding is needed."],
+  ["Scale", "Shortcut: 1 million a day ≈ ? per second", "≈ 12 per second (a day is ~86,400 s)."],
+  ["Scale", "What does \"3 applications per funded loan\" mean?", "A conversion funnel: for each funded loan, ~3 applications were started. Load comes from applications, so drafts expire after 90 days and abandoned files are deleted."],
+  ["Scale", "Why ~100 saves per application?", "~10 sections × ~10 saves each, autosaving on leaving a section or every ~30 s while typing, over several visits."],
+  ["Storage", "Why not store files in Postgres?", "Slow backups, restores and failover at ~40 TB; 5–10× cost per GB; uploads would load the app servers."],
+  ["Storage", "When does the 7-year retention clock start?", "When the loan settles or is declined, not at upload. Tag the object with its retention date at decision time."],
+  ["Storage", "What does Object Lock (compliance mode) give you?", "Nobody, admins included, can delete or change the file during retention. Legal holds can extend it."],
+  ["Upload", "What is a pre-signed URL?", "A URL signed with the server's credentials that allows one action on one object until it expires. S3 recomputes the signature and returns 403 if anything changed."],
+  ["Upload", "Why a pre-signed POST rather than PUT?", "A POST policy lets S3 enforce content-length-range and content type. PUT can't cap the size."],
+  ["Upload", "Does each user get their own bucket?", "No. One bucket, separate keys. The signature is scoped to one key and the API checks ownership. Separate buckets by trust level: quarantine, clean, infected."],
+  ["Upload", "Order of calls when a user drops 3 files?", "① API registers files and returns signed URLs → ② browser uploads to S3 directly → ③ S3 triggers the scan → ④ browser checks status via the API."],
+  ["Upload", "Why limit parallel uploads to ~3?", "On mobile they share the same bandwidth; more connections aren't faster overall and cause more timeouts."],
+  ["Scanning", "Why put a queue in front of the scanner?", "Fast upload response, absorbs spikes, isolates failures, automatic retries and DLQ."],
+  ["Scanning", "Messages can arrive twice. How do you stay correct?", "Make processing idempotent: conditional updates like WHERE status = 'SCANNING'. Scanning twice is harmless."],
+  ["Scanning", "Give three \"fail closed\" rules.", "Submit blocked while scanning; only the scanner reads quarantine; stale virus definitions stop the worker; UNSUPPORTED files are rejected."],
+  ["Scanning", "Why copy → DB update → delete, in that order?", "A crash at any point can be retried safely. Leftovers in quarantine expire after 24 h."],
+  ["Scanning", "GuardDuty returns ACCESS_DENIED. What do you do?", "It's our IAM/KMS configuration, not the customer's fault. Keep the file pending, alert on-call, retry."],
+  ["Scanning", "Object tags vs metadata?", "Metadata is fixed at upload. Tags are up to 10 key–value pairs stored next to the object, changeable any time, usable in policies and lifecycle rules."],
+  ["Scanning", "EventBridge in one sentence?", "AWS's event router: services publish events, your rules filter them, and matches go to targets like SQS or Lambda."],
+  ["Scanning", "Why put SQS between EventBridge and Lambda?", "EventBridge only delivers. SQS holds messages, absorbs spikes, retries failures and moves poison messages to a DLQ."],
+  ["Scanning", "Why keep a reconciliation job?", "Events can be lost. Every ~15 min, find documents still pending whose object exists, read the tag, and process or alert."],
+  ["CBA", "What's CBA's big advantage for this design?", "Most applicants are existing customers: identity already verified, income visible. Pre-fill and make uploads the exception; use CDR for other banks."],
+  ["API", "What is GET /applications?status= for?", "Resuming drafts on any device, avoiding duplicate drafts, and showing what needs action or is in progress. Summaries only, always the signed-in user's own."],
+  ["API", "Which endpoint powers the Review & submit page?", "GET /applications/{id}/validation: runs the submit rules without submitting, lists problems and disables Submit. Shares code with submit's 422."],
+  ["API", "Why does submit return 202, not 200?", "Assessment happens asynchronously; 202 means accepted for processing."],
+  ["API", "After a save succeeds, what must the client do with the ETag?", "Replace the stored ETag with the new one from the response, or the next autosave gets 412 against itself."],
+  ["API", "On 412, should the client retry with the new ETag automatically?", "No: that overwrites the other device's change. Fetch the latest and let the user choose."],
+  ["API", "Where is the ETag stored?", "Server: an integer version column (ETag built from it). Client: in memory next to the section's data; with offline drafts, saved alongside the draft."],
+  ["API", "Why might browser JavaScript be unable to read the ETag?", "On a cross-origin API, the server must send Access-Control-Expose-Headers: ETag."],
+  ["API", "In Next.js, why is there no GET on first load?", "The Server Component reads the DB directly and passes data + version as props. ETags matter from the first save."],
+  ["CBA", "Why mention CPS 230?", "Origination is likely a critical operation, so define recovery targets and tolerance for disruption: idempotent submits, outbox, multi-AZ."],
+  ["API", "How do you stop two devices overwriting each other's saves?", "Optimistic concurrency: ETag + If-Match. The losing save gets 412 with the latest data."],
+];
+const fcState = JSON.parse(localStorage.getItem("hl-fc") || '{"known":[]}');
+let order = cards.map((_, i) => i), pos = 0, revealed = false, onlyUnknown = false;
+function fcRender() {
+  const pool = onlyUnknown ? order.filter((i) => !fcState.known.includes(i)) : order;
+  const known = fcState.known.length;
+  $("fc-progress").textContent = `${known} / ${cards.length} known`;
+  $("fc-bar").value = Math.round((known / cards.length) * 100);
+  if (pool.length === 0) {
+    $("fc-topic").textContent = "Done"; $("fc-q").textContent = "You've marked every card as known. 🎉";
+    $("fc-a").classList.add("hidden"); $("fc-hint").classList.add("hidden"); return;
+  }
+  pos = (pos + pool.length) % pool.length;
+  const idx = pool[pos], [topic, q, a] = cards[idx];
+  $("fc-topic").textContent = `${topic} · ${pos + 1}/${pool.length}` + (fcState.known.includes(idx) ? " · known" : "");
+  $("fc-q").textContent = q; $("fc-a").textContent = a;
+  $("fc-a").classList.toggle("hidden", !revealed); $("fc-hint").classList.toggle("hidden", revealed);
+  $("fc-known").textContent = fcState.known.includes(idx) ? "Mark unknown" : "I know this ✓";
+  $("fc-known").dataset.idx = idx;
+}
+const fcMove = (d) => { pos += d; revealed = false; fcRender(); };
+$("fc-card").addEventListener("click", () => { revealed = !revealed; fcRender(); });
+$("fc-prev").addEventListener("click", () => fcMove(-1));
+$("fc-next").addEventListener("click", () => fcMove(1));
+$("fc-shuffle").addEventListener("click", () => { order.sort(() => Math.random() - 0.5); pos = 0; revealed = false; fcRender(); });
+$("fc-only-unknown").addEventListener("click", (e) => { onlyUnknown = !onlyUnknown; e.target.classList.toggle("btn-active", onlyUnknown); pos = 0; revealed = false; fcRender(); });
+$("fc-known").addEventListener("click", (e) => {
+  const idx = Number(e.target.dataset.idx);
+  fcState.known = fcState.known.includes(idx) ? fcState.known.filter((i) => i !== idx) : [...fcState.known, idx];
+  localStorage.setItem("hl-fc", JSON.stringify(fcState));
+  if (onlyUnknown) revealed = false; else fcMove(1);
+  fcRender();
+});
+document.addEventListener("keydown", (e) => {
+  if (["INPUT", "TEXTAREA"].includes(document.activeElement?.tagName)) return;
+  const r = $("fc-card").getBoundingClientRect();
+  if (r.bottom < 0 || r.top > innerHeight) return; // only when flashcards are on screen
+  if (e.key === " ") { e.preventDefault(); revealed = !revealed; fcRender(); }
+  else if (e.key === "ArrowRight") fcMove(1);
+  else if (e.key === "ArrowLeft") fcMove(-1);
+  else if (e.key.toLowerCase() === "k") $("fc-known").click();
+});
+fcRender();
+
+// ---------- quiz ----------
+const quiz = [
+  ["Roughly what peak write rate did we estimate?", ["~10/s", "~100/s", "~10,000/s", "~1,000,000/s"], 1, "2/s average × 10 busy hour × 5 spike day ≈ 100/s."],
+  ["Where does the browser send the file bytes?", ["Your API", "Directly to S3", "EventBridge", "Postgres"], 1, "Via a pre-signed URL, so the API never handles the file."],
+  ["Which call happens first?", ["Upload to S3", "GuardDuty scan", "API registers the document", "Status check"], 2, "S3 can't authorise; the API checks ownership and creates the row first."],
+  ["What can enforce a maximum file size at S3?", ["Pre-signed PUT", "Pre-signed POST policy", "An object tag", "The React component"], 1, "content-length-range in the POST policy."],
+  ["How are users kept apart in a shared bucket?", ["One bucket per user", "Signature scoped to one key + API ownership check", "Object tags", "Obscure filenames"], 1, "Change the key and the signature no longer matches → 403."],
+  ["GuardDuty returns ACCESS_DENIED. What's the right response?", ["Reject the file", "Accept the file", "Keep pending, alert on-call, retry", "Delete the application"], 2, "It's our IAM/KMS config, not the customer."],
+  ["Virus definitions are 3 days old. The worker should…", ["Scan anyway", "Stop and alert (fail closed)", "Accept all files", "Skip scanning"], 1, "Fail closed: don't pass files you can't scan properly."],
+  ["When does the 7-year retention clock start?", ["At upload", "At submit", "When the loan settles or is declined", "When the draft expires"], 2, "Tag the retention date at decision time."],
+  ["Best home for ~40 TB of documents?", ["Postgres bytea", "Object storage with lifecycle tiers", "Redis", "App server disk"], 1, "Cheap, durable, and tiers cut cost ~80%+."],
+  ["A section save returns 412. What should the client do?", ["Retry with the new ETag", "Show the conflict and let the user choose", "Ignore it", "Delete the draft"], 1, "Auto-retrying would overwrite the other device's change."],
+  ["Which endpoint lets the Review page disable Submit?", ["GET /applications", "GET /applications/{id}/validation", "POST /submit", "GET /requests"], 1, "It runs the submit rules without submitting."],
+  ["What does EventBridge do in this design?", ["Stores files", "Routes the scan-result event to your queue", "Scans for malware", "Signs URLs"], 1, "A rule matches GuardDuty's event and sends it to SQS → Lambda."],
+];
+const quizAnswers = {};
+function renderQuiz() {
+  const root = $("quiz"); root.replaceChildren();
+  quiz.forEach(([q, opts, correct, why], qi) => {
+    const block = el("div", "space-y-2");
+    block.append(el("p", "font-medium", `${qi + 1}. ${q}`));
+    const optsWrap = el("div", "grid sm:grid-cols-2 gap-2");
+    opts.forEach((o, oi) => {
+      const b = el("button", "btn btn-sm justify-start h-auto py-2 text-left font-normal", o);
+      const answered = qi in quizAnswers;
+      if (answered) {
+        b.disabled = true;
+        if (oi === correct) b.classList.add("btn-success");
+        else if (oi === quizAnswers[qi]) b.classList.add("btn-error");
+      }
+      b.addEventListener("click", () => { quizAnswers[qi] = oi; renderQuiz(); });
+      optsWrap.append(b);
+    });
+    block.append(optsWrap);
+    if (qi in quizAnswers) {
+      const ok = quizAnswers[qi] === correct;
+      block.append(el("div", `alert alert-soft ${ok ? "alert-success" : "alert-error"} text-sm`, (ok ? "Correct. " : "Not quite. ") + why));
+    }
+    root.append(block);
+  });
+  const answered = Object.keys(quizAnswers).length;
+  const score = Object.entries(quizAnswers).filter(([qi, a]) => quiz[qi][2] === a).length;
+  $("quiz-score").textContent = `${score} / ${answered} correct · ${quiz.length - answered} left`;
+}
+$("quiz-reset").addEventListener("click", () => { Object.keys(quizAnswers).forEach((k) => delete quizAnswers[k]); renderQuiz(); });
+renderQuiz();
+
+// ---------- glossary ----------
+const glossary = [
+  ["Pre-signed URL", "A time-limited URL signed by the server that lets the holder do one action on one object."],
+  ["Pre-signed POST", "Signed upload policy with conditions (size range, content type) that S3 enforces."],
+  ["Object key", "The path of an object inside a bucket, e.g. app-111/doc-aaa."],
+  ["Object tag", "Key–value label stored next to an S3 object; changeable; usable in policies."],
+  ["Lifecycle rule", "Bucket rule that moves objects to cheaper tiers or deletes them by age or tag."],
+  ["Object Lock", "Write-once-read-many protection; compliance mode stops anyone deleting during retention."],
+  ["Quarantine bucket", "Where untrusted uploads land until scanned; only the scanner can read it."],
+  ["GuardDuty Malware Protection for S3", "Managed AWS scanning of new objects; tags results and emits events."],
+  ["EventBridge", "AWS event router: events → rules → targets."],
+  ["SQS", "Message queue; holds messages, retries, dead-letter queue."],
+  ["SNS", "Pub/sub fan-out to many subscribers."],
+  ["DLQ", "Dead-letter queue: where messages go after repeated failures, for alerting and investigation."],
+  ["At-least-once delivery", "A message may be delivered more than once; consumers must be idempotent."],
+  ["Idempotency-Key", "Client-sent key so retries of the same request return the first result."],
+  ["ETag / If-Match", "Version tag used for optimistic concurrency; mismatched saves get 412."],
+  ["Outbox pattern", "Write the event to a DB table in the same transaction as the state change; a relay publishes it later."],
+  ["Fail closed", "When unsure (scanner down, can't scan), block rather than allow."],
+  ["CDR", "Content disarm and reconstruction: rebuild a file without active content. In CBA context, also Consumer Data Right."],
+  ["ClamAV / clamd", "Open-source antivirus engine; clamd is its daemon that keeps signatures in memory."],
+  ["Visibility timeout", "How long a received SQS message stays hidden before reappearing if not deleted."],
+  ["CPS 234", "APRA standard on information security."],
+  ["CPS 230", "APRA standard on operational resilience; critical operations need tolerance levels."],
+  ["NCCP", "National Consumer Credit Protection Act: responsible lending, verify income and expenses."],
+  ["AML/CTF", "Anti-money-laundering rules: identity verification and 7-year record keeping."],
+  ["Optimistic concurrency", "Let everyone edit; check the version at save time and reject stale saves, instead of locking."],
+  ["412 Precondition Failed", "The If-Match version is no longer current: someone else saved first."],
+  ["428 Precondition Required", "The request is missing a required If-Match header."],
+  ["202 Accepted", "Request accepted for processing that completes later (e.g. assessment)."],
+  ["Access-Control-Expose-Headers", "CORS header that lets browser JavaScript read response headers like ETag on cross-origin calls."],
+  ["Server Component", "Next.js component rendered on the server; can read the database directly."],
+  ["Route Handler", "Next.js app/api/.../route.ts file exporting GET, PUT, etc.: a normal HTTP endpoint."],
+  ["Server Action", "Next.js server function called from the client like a function; web-only, no HTTP semantics such as ETags."],
+  ["BFF", "Backend-for-frontend: a thin server layer (e.g. Next.js) between the UI and core services."],
+  ["Unloan", "CBA's digital-only home loan brand."],
+];
+function renderGlossary(filter = "") {
+  const body = $("glossary-body"); body.replaceChildren();
+  const f = filter.toLowerCase();
+  glossary.filter(([t, d]) => (t + d).toLowerCase().includes(f)).forEach(([t, d]) => {
+    const tr = el("tr"); tr.append(el("td", "font-semibold whitespace-nowrap", t), el("td", "text-sm", d)); body.append(tr);
+  });
+}
+$("glossary-filter").addEventListener("input", (e) => renderGlossary(e.target.value));
+renderGlossary();
+
+// ---------- scroll spy ----------
+const links = [...document.querySelectorAll("#side-menu a")];
+const spy = new IntersectionObserver((entries) => {
+  entries.forEach((en) => {
+    if (en.isIntersecting) links.forEach((a) => a.classList.toggle("menu-active", a.getAttribute("href") === "#" + en.target.id));
+  });
+}, { rootMargin: "-30% 0px -65% 0px" });
+document.querySelectorAll("main section").forEach((s) => spy.observe(s));
+links.forEach((a) => a.addEventListener("click", () => { $("nav-drawer").checked = false; }));
+
+// ---------- theme ----------
+const themeToggle = $("theme-toggle");
+function applyTheme(dark) {
+  document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+  localStorage.setItem("hl-theme", dark ? "dark" : "light");
+  buildCharts();
+  window.renderDiagrams?.();
+}
+themeToggle.checked = localStorage.getItem("hl-theme") === "dark";
+document.documentElement.setAttribute("data-theme", themeToggle.checked ? "dark" : "light");
+themeToggle.addEventListener("change", () => applyTheme(themeToggle.checked));
+buildCharts();
+</script>
+
+<script type="module">
+import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+const nodes = [...document.querySelectorAll("pre.mermaid")];
+nodes.forEach((n) => (n.dataset.src = n.textContent));
+window.renderDiagrams = async () => {
+  const dark = document.documentElement.getAttribute("data-theme") === "dark";
+  mermaid.initialize({ startOnLoad: false, theme: dark ? "dark" : "default", securityLevel: "strict" });
+  nodes.forEach((n) => { n.removeAttribute("data-processed"); n.textContent = n.dataset.src; });
+  await mermaid.run({ nodes });
+  // Wide diagrams keep their natural size and scroll, instead of shrinking to unreadable text
+  document.querySelectorAll(".diagram-wide svg").forEach((svg) => {
+    const natural = svg.style.maxWidth;
+    if (natural) { svg.style.width = natural; svg.style.maxWidth = "none"; }
+  });
+};
+window.renderDiagrams();
+</script>
+</body>
+</html>
